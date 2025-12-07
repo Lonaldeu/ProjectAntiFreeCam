@@ -4,7 +4,7 @@
 
 [![Folia](https://img.shields.io/badge/Folia-✓-green)](https://papermc.io/software/folia)
 [![Paper](https://img.shields.io/badge/Paper-✓-green)](https://papermc.io/software/paper)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
 </div>
 
@@ -288,15 +288,20 @@ This fork adds significant improvements over [TazAntixRAY](https://github.com/Mi
 
 ## 🙏 Credits
 
-- **Original Project**: [TazAntixRAY](https://github.com/MinhTaz/TazAntixRAY) by MinhTaz
-- **Fork Maintainer**: [Lonaldeu](https://github.com/lonaldeu)
+- **Base Project**: [TazAntixRAY](https://github.com/MinhTaz/TazAntixRAY) by MinhTaz
 - **PacketEvents**: [retrooper/packetevents](https://github.com/retrooper/packetevents)
 
 <br>
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
+
+Since this is a fork of [TazAntixRAY](https://github.com/MinhTaz/TazAntixRAY) (GPL-3.0), this project must also be distributed under GPL-3.0. This means:
+- ✅ You can use, modify, and distribute this code
+- ✅ You must provide source code with any distribution
+- ✅ Any derivatives must also be GPL-3.0
+- ✅ You must include this license with distributions
 
 ---
 

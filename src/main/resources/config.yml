@@ -1,0 +1,266 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#    ██████╗ ██████╗  ██████╗      ██╗███████╗ ██████╗████████╗
+#    ██╔══██╗██╔══██╗██╔═══██╗     ██║██╔════╝██╔════╝╚══██╔══╝
+#    ██████╔╝██████╔╝██║   ██║     ██║█████╗  ██║        ██║   
+#    ██╔═══╝ ██╔══██╗██║   ██║██   ██║██╔══╝  ██║        ██║   
+#    ██║     ██║  ██║╚██████╔╝╚█████╔╝███████╗╚██████╗   ██║   
+#    ╚═╝     ╚═╝  ╚═╝ ╚═════╝  ╚════╝ ╚══════╝ ╚═════╝   ╚═╝   
+#
+#     █████╗ ███╗   ██╗████████╗██╗███████╗██████╗ ███████╗███████╗ ██████╗ █████╗ ███╗   ███╗
+#    ██╔══██╗████╗  ██║╚══██╔══╝██║██╔════╝██╔══██╗██╔════╝██╔════╝██╔════╝██╔══██╗████╗ ████║
+#    ███████║██╔██╗ ██║   ██║   ██║█████╗  ██████╔╝█████╗  █████╗  ██║     ███████║██╔████╔██║
+#    ██╔══██║██║╚██╗██║   ██║   ██║██╔══╝  ██╔══██╗██╔══╝  ██╔══╝  ██║     ██╔══██║██║╚██╔╝██║
+#    ██║  ██║██║ ╚████║   ██║   ██║██║     ██║  ██║███████╗███████╗╚██████╗██║  ██║██║ ╚═╝ ██║
+#    ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝     ╚═╝
+#
+#                      ProjectAntiFreeCam Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+# Packet-based anti-freecam protection with Y-level visibility control
+# Supports: Paper, Folia, Geyser/Floodgate (Bedrock Edition)
+# Reload config: /antifreecam reload (requires permission)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                          CORE SETTINGS                                  │
+# └─────────────────────────────────────────────────────────────────────────┘
+settings:
+  # Enable debug mode for detailed logging
+  # Set to true for troubleshooting, false for production
+  debug-mode: false
+
+  # Refresh cooldown in seconds to prevent lag from rapid Y-level changes
+  # Higher values = less lag but slower updates
+  # Lower values = faster updates but potential lag
+  refresh-cooldown-seconds: 3
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                        WORLD CONFIGURATION                              │
+# └─────────────────────────────────────────────────────────────────────────┘
+worlds:
+  # List of worlds where anti-xray is active
+  # Add world names exactly as they appear in your server folder
+  whitelist:
+    - "world"
+    - "mining_world"
+    # - "survival_world"
+    # - "resource_world"
+
+  # IMPORTANT: Avoid adding these world types:
+  # - Nether worlds (world_nether)
+  # - End worlds (world_the_end)
+  # - Creative worlds
+  # These can cause visual glitches or performance issues
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                     ANTI-FREECAM SETTINGS                               │
+# └─────────────────────────────────────────────────────────────────────────┘
+antixray:
+  # Y-level threshold for anti-xray protection
+  # When player is ABOVE this level: Hide everything below hide-below-y
+  # When player is AT or BELOW this level: Show everything normally
+  protection-y-level: 31.0
+
+  # Y-level below which blocks are hidden (when protection is active)
+  # All blocks at this Y-level and below will be hidden
+  hide-below-y: 16
+
+  # Smooth transition between hidden and visible states
+  transition:
+    # Enable smooth Y-level transitions (prevents sudden pop-in)
+    enabled: true
+    # Size of the transition zone in blocks (gradual reveal)
+    zone-size: 5
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                       ENTITY HIDING SETTINGS                            │
+# └─────────────────────────────────────────────────────────────────────────┘
+entities:
+  # Hide entities in protected underground areas
+  # Prevents freecam users from seeing armor stands, item frames, etc.
+  hide-entities: true
+
+  # Entity types that will be hidden in protected areas
+  # Includes display entities, minecarts, and all mobs
+  hidden-types:
+    # Display entities (commonly used for item storage)
+    - ARMOR_STAND
+    - ITEM_FRAME
+    - GLOW_ITEM_FRAME
+    - PAINTING
+    # Minecarts
+    - MINECART
+    - CHEST_MINECART
+    - HOPPER_MINECART
+    - TNT_MINECART
+    - FURNACE_MINECART
+    - SPAWNER_MINECART
+    # Hostile mobs
+    - ZOMBIE
+    - SKELETON
+    - CREEPER
+    - SPIDER
+    - CAVE_SPIDER
+    - ENDERMAN
+    - WITCH
+    - SLIME
+    - MAGMA_CUBE
+    - SILVERFISH
+    - ENDERMITE
+    - GUARDIAN
+    - ELDER_GUARDIAN
+    - SHULKER
+    - PHANTOM
+    - DROWNED
+    - HUSK
+    - STRAY
+    - ZOMBIE_VILLAGER
+    - PILLAGER
+    - VINDICATOR
+    - EVOKER
+    - VEX
+    - RAVAGER
+    - HOGLIN
+    - ZOGLIN
+    - PIGLIN
+    - PIGLIN_BRUTE
+    - WARDEN
+    - BREEZE
+    - BOGGED
+    # Passive mobs
+    - PIG
+    - COW
+    - SHEEP
+    - CHICKEN
+    - RABBIT
+    - HORSE
+    - DONKEY
+    - MULE
+    - LLAMA
+    - TRADER_LLAMA
+    - GOAT
+    - FROG
+    - TADPOLE
+    - CAMEL
+    - SNIFFER
+    - ARMADILLO
+    # Tameable mobs
+    - WOLF
+    - CAT
+    - PARROT
+    - FOX
+    - OCELOT
+    # Aquatic mobs
+    - SQUID
+    - GLOW_SQUID
+    - DOLPHIN
+    - COD
+    - SALMON
+    - TROPICAL_FISH
+    - PUFFERFISH
+    - TURTLE
+    - AXOLOTL
+    # Utility mobs
+    - IRON_GOLEM
+    - SNOW_GOLEM
+    - VILLAGER
+    - WANDERING_TRADER
+    - ALLAY
+    - BEE
+    - BAT
+    - STRIDER
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                       PERFORMANCE SETTINGS                              │
+# └─────────────────────────────────────────────────────────────────────────┘
+performance:
+  # MASSIVE RAM CACHING - Trade RAM for CPU performance
+  # When enabled: Uses ~12-15MB extra RAM for 10-15x faster packet processing
+  # When disabled: Uses local per-listener caches (higher CPU, lower RAM)
+  # 
+  # RAM Cache sizes (when enabled):
+  # - Player states: 1,000 entries
+  # - Chunk metadata: 50,000 entries
+  # - Entity positions: 50,000 entries
+  # - Visibility decisions: 50,000 entries
+  # - Processed chunks: 100,000 entries
+  # - Bedrock player detection: 1,000 entries
+  #
+  # Recommended: true for servers with 50+ players
+  # Set to false if RAM is critical and CPU is not a concern
+  ram-caching: true
+
+  # Instant protection settings - load large area immediately
+  instant-protection:
+    enabled: true
+    # Load this many chunks radius instantly when player approaches Y16
+    instant-load-radius: 15
+    # Pre-load protection when player is this many blocks above Y16
+    pre-load-distance: 10
+    # Force immediate chunk refresh (prevents seeing bases)
+    force-immediate-refresh: true
+
+  # Limit the anti-xray effect to a small area around the player
+  limited-area:
+    enabled: false
+    # The radius in chunks around the player to apply the effect
+    chunk-radius: 3
+    # Only apply when the player is nearby
+    apply-only-near-player: true
+
+  # Block replacement settings
+  replacement:
+    # The block type used to replace hidden ores (e.g., "air", "deepslate", "stone")
+    block-type: "air"
+
+  # Complete underground protection
+  underground-protection:
+    # Hide everything below Y16 when player is ABOVE Y16
+    # When player reaches Y16 or below: Show everything normally
+    enabled: true
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                     BEDROCK EDITION SUPPORT                             │
+# └─────────────────────────────────────────────────────────────────────────┘
+bedrock:
+  # Enable Bedrock Edition support
+  enabled: true
+
+  # Detection methods (tried in order until one succeeds)
+  detection:
+    # Use Geyser API if available
+    use-geyser-api: true
+    
+    # Use Floodgate API if available
+    use-floodgate-api: true
+    
+    # Detect by UUID pattern (Bedrock UUIDs start with 00000000-0000-0000-)
+    use-uuid-pattern: true
+    
+    # Detect by player name prefix
+    use-name-prefix: true
+    
+    # Custom prefixes to detect Bedrock players
+    name-prefixes:
+      - "."
+
+  # Performance optimizations for Bedrock/mobile players
+  optimizations:
+    # Reduce chunk radius for Bedrock players (helps with mobile performance)
+    chunk-radius-reduction: 1
+    
+    # Minimum chunk radius (won't go below this even with reduction)
+    minimum-chunk-radius: 2
+
+  # Logging options
+  logging:
+    # Log when a Bedrock player is detected
+    log-detection: true
+    
+    # Log which detection method was used
+    log-detection-method: false
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                      DO NOT MODIFY BELOW                                │
+# └─────────────────────────────────────────────────────────────────────────┘
+config-version: 1

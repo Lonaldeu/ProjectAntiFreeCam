@@ -1,0 +1,49 @@
+name: ProjectAntiFreeCam
+version: '1.0.0'
+main: me.lonaldeu.projectantifreecam.AntiFreeCam
+api-version: '1.20'
+folia-supported: true
+load: STARTUP
+depend: [packetevents]
+authors: [lonaldeu]
+description: Packet-based anti-freecam protection with Y-level visibility control and Bedrock support
+softdepend: [Geyser, Floodgate]
+
+commands:
+  antifreecam:
+    description: Main command for ProjectAntiFreeCam plugin.
+    usage: /antifreecam <debug|reload|world|stats|test> [args]
+    permission: antifreecam.admin
+    aliases: [afc, freecam]
+  afcdebug:
+    description: Toggles debug mode for ProjectAntiFreeCam plugin.
+    usage: /afcdebug
+    permission: antifreecam.debug
+    aliases: [antifreecamdebug]
+  afcreload:
+    description: Reloads the ProjectAntiFreeCam configuration.
+    usage: /afcreload
+    permission: antifreecam.admin
+    aliases: [antifreecamreload]
+  afcworld:
+    description: Manages the world whitelist for ProjectAntiFreeCam.
+    usage: /afcworld <list|add|remove> [worldName]
+    permission: antifreecam.admin
+    aliases: [antifreecamworld]
+permissions:
+  antifreecam.admin:
+    description: Allows access to ProjectAntiFreeCam admin commands.
+    default: op
+    children:
+      antifreecam.debug: true
+      antifreecam.world: true
+      antifreecam.reload: true
+  antifreecam.debug:
+    description: Allows toggling of ProjectAntiFreeCam debug mode.
+    default: op
+  antifreecam.world:
+    description: Allows managing world whitelist for ProjectAntiFreeCam.
+    default: op
+  antifreecam.reload:
+    description: Allows reloading ProjectAntiFreeCam configuration.
+    default: op

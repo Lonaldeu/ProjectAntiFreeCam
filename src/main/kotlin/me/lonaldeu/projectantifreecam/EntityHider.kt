@@ -1,3 +1,10 @@
+/*
+ * This project is a fork of TazAntixRAY
+ * Original project: https://github.com/MinhTaz/TazAntixRAY
+ * Original author: MinhTaz
+ * Licensed under GNU General Public License v3.0
+ */
+
 package me.lonaldeu.projectantifreecam
 
 import org.bukkit.Bukkit

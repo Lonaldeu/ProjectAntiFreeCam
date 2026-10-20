@@ -25,7 +25,19 @@ antixray:
   underground-view-depth: 48
 
 entities:
+  # Hide listed entities (and players) that are below the hidden level.
   hide-entities: true
+  # Hide listed entities (and players) from anyone who can't see them through solid blocks,
+  # so ESP / wallhack clients don't learn where they are. Glass and leaves don't block sight.
+  # Spectators and players with antifreecam.bypass see everything.
+  line-of-sight:
+    enabled: true
+    # How often each player's view is re-checked, in ticks (20 ticks = 1 second).
+    check-interval-ticks: 2
+    # Entities this close are always shown.
+    always-visible-distance: 3
+    # Entities farther than this aren't checked.
+    max-distance: 64
   # Entity types hidden while underground. Players are always hidden.
   hidden-types:
     - ARMOR_STAND

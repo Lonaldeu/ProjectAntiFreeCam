@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.BiConsumer;
 import java.util.logging.Logger;
 
@@ -43,6 +44,10 @@ final class Nms {
     private Field skyMask, blockMask, emptySkyMask, emptyBlockMask, skyArrays, blockArrays;
     private Field[] lightPacketFields, lightDataFields;
     private final Map<Class<?>, Method> blockPosOf = new HashMap<>(), yOf = new HashMap<>();
+    // Tab-list removal; null when unavailable (line-of-sight culling then briefly drops players from the tab list).
+    Class<?> playerInfoRemovePacket;
+    private Method profileIds;
+    private Constructor<?> newPlayerInfoRemove;
 
     Nms(Logger log) throws ReflectiveOperationException {
         chunkPacket = Class.forName(GAME + "ClientboundLevelChunkWithLightPacket");
@@ -114,6 +119,24 @@ final class Nms {
             blockPosOf.clear();
             yOf.clear();
         }
+
+        try {
+            Class<?> c = Class.forName(GAME + "ClientboundPlayerInfoRemovePacket");
+            profileIds = c.getMethod("profileIds");
+            newPlayerInfoRemove = c.getConstructor(List.class);
+            playerInfoRemovePacket = c;
+        } catch (ReflectiveOperationException e) {
+            log.warning("Players hidden by line of sight will flicker in the tab list on this version: " + e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    List<UUID> profileIds(Object playerInfoRemove) {
+        return (List<UUID>) call(profileIds, playerInfoRemove);
+    }
+
+    Object playerInfoRemove(List<UUID> ids) {
+        return construct(newPlayerInfoRemove, ids);
     }
 
     void setAirIds(Set<Integer> ids) {

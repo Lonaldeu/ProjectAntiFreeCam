@@ -31,15 +31,22 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
         AntiFreeCam.View view = plugin.views.get(player);
         Object out = msg;
-        if (view != null) {
-            try {
-                out = filter(msg, view.minY(), view.maxHiddenY());
-            } catch (RuntimeException e) {
-                if (plugin.debug) plugin.getLogger().warning("Could not filter " + msg.getClass().getSimpleName() + ": " + e);
-            }
+        try {
+            if (msg.getClass() == nms.playerInfoRemovePacket) out = keepCulledPlayersInTab(msg);
+            else if (view != null) out = filter(msg, view.minY(), view.maxHiddenY());
+        } catch (RuntimeException e) {
+            if (plugin.debug) plugin.getLogger().warning("Could not filter " + msg.getClass().getSimpleName() + ": " + e);
         }
         if (out == null) promise.trySuccess();
         else ctx.write(out, promise);
+    }
+
+    /** Hiding a player behind a wall would also drop them from the tab list; keep them there. */
+    private Object keepCulledPlayersInTab(Object packet) {
+        List<UUID> ids = nms.profileIds(packet);
+        List<UUID> removed = ids.stream().filter(id -> !plugin.lineOfSightCuller.shouldKeepInTab(player, id)).toList();
+        if (removed.size() == ids.size()) return packet;
+        return removed.isEmpty() ? null : nms.playerInfoRemove(removed);
     }
 
     /** The packet to send in place of {@code msg}, or null to drop it. */

@@ -44,6 +44,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     private final Map<UUID, Long> nextRefreshAt = new ConcurrentHashMap<>();
     private final Set<UUID> refreshQueued = ConcurrentHashMap.newKeySet();
     final Bedrock bedrock = new Bedrock(this);
+    final LineOfSight lineOfSightCuller = new LineOfSight(this);
     Nms nms;
 
     // Settings snapshot, read from netty threads too.
@@ -61,6 +62,10 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     volatile int maxChunksPerTick;
     volatile boolean limitedArea;
     volatile int limitedRadius;
+    volatile boolean lineOfSight;
+    volatile long losInterval;
+    volatile double losMaxDistance, losAlwaysVisible;
+    volatile Set<String> losTypeKeys = Set.of();
 
     @Override
     public void onEnable() {
@@ -129,6 +134,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     private void track(Player p) {
         hook(p);
         p.getScheduler().runAtFixedRate(this, t -> update(p, p.getLocation(), false), null, 1, 1);
+        lineOfSightCuller.start(p);
     }
 
     /** Adds the packet filter to the player's connection, just before the server's own packet handler. */
@@ -165,11 +171,14 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         hideEntities = c.getBoolean("entities.hide-entities", true);
         List<String> types = c.getStringList("entities.hidden-types");
         Set<String> keys = new HashSet<>();
-        if (hideEntities) {
-            for (String t : types.isEmpty() ? FALLBACK_TYPES : types) keys.add("minecraft:" + t.toLowerCase(Locale.ROOT));
-            keys.add("minecraft:player");
-        }
-        hiddenTypeKeys = Set.copyOf(keys);
+        for (String t : types.isEmpty() ? FALLBACK_TYPES : types) keys.add("minecraft:" + t.toLowerCase(Locale.ROOT));
+        keys.add("minecraft:player");
+        hiddenTypeKeys = hideEntities ? Set.copyOf(keys) : Set.of();
+        losTypeKeys = Set.copyOf(keys);
+        lineOfSight = c.getBoolean("entities.line-of-sight.enabled", true);
+        losInterval = Math.max(1, c.getInt("entities.line-of-sight.check-interval-ticks", 2));
+        losMaxDistance = c.getDouble("entities.line-of-sight.max-distance", 64);
+        losAlwaysVisible = c.getDouble("entities.line-of-sight.always-visible-distance", 3);
 
         String block = c.getString("performance.replacement.block-type", "air");
         BlockData data;
@@ -285,9 +294,9 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         if (!hideEntities) return;
         World world = p.getWorld();
         List<Entity> nearby = p.getNearbyEntities(64, world.getMaxHeight() - world.getMinHeight(), 64);
-        for (Entity e : nearby) p.hideEntity(this, e);
+        for (Entity e : nearby) lineOfSightCuller.hideKeepingTab(p, e);
         p.getScheduler().runDelayed(this, t -> {
-            for (Entity e : nearby) if (e.isValid()) p.showEntity(this, e);
+            for (Entity e : nearby) if (e.isValid() && !lineOfSightCuller.isCulled(p, e)) p.showEntity(this, e);
         }, null, 2);
     }
 
@@ -304,6 +313,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         views.remove(id);
         nextRefreshAt.remove(id);
         refreshQueued.remove(id);
+        lineOfSightCuller.forget(id);
     }
 
     // Paper fires this before the destination chunks are sent, so the state is right from the first chunk.

@@ -1,0 +1,37 @@
+name: ProjectAntiFreeCam
+version: '${version}'
+main: me.lonaldeu.antifreecam.AntiFreeCam
+api-version: '1.20'
+description: Hides underground blocks and entities from players standing above ground.
+authors: [Lonaldeu]
+depend: [packetevents]
+softdepend: [Geyser-Spigot, floodgate]
+folia-supported: true
+
+commands:
+  antifreecam:
+    aliases: [afc, freecam]
+    usage: /antifreecam <debug|reload|world|stats|test> [args]
+  afcdebug:
+    aliases: [antifreecamdebug]
+    usage: /afcdebug
+  afcreload:
+    aliases: [antifreecamreload]
+    usage: /afcreload
+  afcworld:
+    aliases: [antifreecamworld]
+    usage: /afcworld <list|add|remove> [world]
+
+permissions:
+  antifreecam.admin:
+    default: op
+    children:
+      antifreecam.debug: true
+      antifreecam.world: true
+      antifreecam.reload: true
+  antifreecam.debug:
+    default: op
+  antifreecam.world:
+    default: op
+  antifreecam.reload:
+    default: op

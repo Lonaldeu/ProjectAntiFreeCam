@@ -1,0 +1,139 @@
+settings:
+  # Log state changes to the console.
+  debug-mode: false
+  # Minimum seconds between view refreshes when a player rises above the protection level.
+  refresh-cooldown-seconds: 3
+
+worlds:
+  # Worlds where protection applies (exact, case-sensitive names).
+  # The Nether, the End and creative worlds rarely need it.
+  whitelist:
+    - world
+    - mining_world
+
+antixray:
+  # Players at or above this Y count as "above ground".
+  protection-y-level: 31.0
+  # Blocks and entities at or below this Y are hidden from above-ground players.
+  hide-below-y: 16
+
+entities:
+  hide-entities: true
+  # Entity types hidden while underground. Players are always hidden.
+  hidden-types:
+    - ARMOR_STAND
+    - ITEM_FRAME
+    - GLOW_ITEM_FRAME
+    - PAINTING
+    - MINECART
+    - CHEST_MINECART
+    - HOPPER_MINECART
+    - TNT_MINECART
+    - FURNACE_MINECART
+    - SPAWNER_MINECART
+    - ZOMBIE
+    - SKELETON
+    - CREEPER
+    - SPIDER
+    - CAVE_SPIDER
+    - ENDERMAN
+    - WITCH
+    - SLIME
+    - MAGMA_CUBE
+    - SILVERFISH
+    - ENDERMITE
+    - GUARDIAN
+    - ELDER_GUARDIAN
+    - SHULKER
+    - PHANTOM
+    - DROWNED
+    - HUSK
+    - STRAY
+    - ZOMBIE_VILLAGER
+    - PILLAGER
+    - VINDICATOR
+    - EVOKER
+    - VEX
+    - RAVAGER
+    - HOGLIN
+    - ZOGLIN
+    - PIGLIN
+    - PIGLIN_BRUTE
+    - WARDEN
+    - BREEZE
+    - BOGGED
+    - PIG
+    - COW
+    - SHEEP
+    - CHICKEN
+    - RABBIT
+    - HORSE
+    - DONKEY
+    - MULE
+    - LLAMA
+    - TRADER_LLAMA
+    - GOAT
+    - FROG
+    - TADPOLE
+    - CAMEL
+    - SNIFFER
+    - ARMADILLO
+    - WOLF
+    - CAT
+    - PARROT
+    - FOX
+    - OCELOT
+    - SQUID
+    - GLOW_SQUID
+    - DOLPHIN
+    - COD
+    - SALMON
+    - TROPICAL_FISH
+    - PUFFERFISH
+    - TURTLE
+    - AXOLOTL
+    - IRON_GOLEM
+    - SNOW_GOLEM
+    - VILLAGER
+    - WANDERING_TRADER
+    - ALLAY
+    - BEE
+    - BAT
+    - STRIDER
+
+performance:
+  # Master switch for hiding.
+  underground-protection:
+    enabled: true
+  # Chunks re-sent per tick during a view refresh.
+  max-chunks-per-tick: 50
+  # Cap the refresh radius (in chunks) below the server view distance.
+  limited-area:
+    enabled: false
+    chunk-radius: 3
+  replacement:
+    # What hidden blocks look like, e.g. air, stone, deepslate.
+    block-type: "air"
+
+advanced:
+  packet-processing:
+    modify-chunk-data: true
+    modify-block-changes: true
+    modify-multi-block-changes: true
+
+bedrock:
+  enabled: true
+  detection:
+    use-geyser-api: true
+    use-floodgate-api: true
+    use-uuid-pattern: true
+    use-name-prefix: true
+    name-prefixes:
+      - "."
+  optimizations:
+    # Bedrock players get a smaller refresh radius.
+    chunk-radius-reduction: 1
+    minimum-chunk-radius: 2
+  logging:
+    log-detection: true
+    log-detection-method: false

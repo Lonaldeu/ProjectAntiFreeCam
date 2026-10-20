@@ -1,87 +1,97 @@
 package me.lonaldeu.antifreecam;
 
-import com.github.retrooper.packetevents.event.PacketListener;
-import com.github.retrooper.packetevents.event.PacketSendEvent;
-import com.github.retrooper.packetevents.protocol.packettype.PacketType;
-import com.github.retrooper.packetevents.protocol.packettype.PacketTypeCommon;
-import com.github.retrooper.packetevents.protocol.world.chunk.BaseChunk;
-import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerBlockChange;
-import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerChunkData;
-import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerMultiBlockChange;
-import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnEntity;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
-/** Rewrites outgoing packets for hidden players. Runs on netty threads: only touches thread-safe plugin state. */
-final class PacketFilter implements PacketListener {
+/**
+ * Sits in one player's netty pipeline, ahead of the packet encoder, and rewrites or drops outgoing packets while
+ * that player's view is hidden. Runs on the netty event loop: only reads thread-safe plugin state.
+ */
+final class PacketFilter extends ChannelOutboundHandlerAdapter {
+
+    static final String NAME = "antifreecam_filter";
 
     private final AntiFreeCam plugin;
+    private final Nms nms;
+    private final UUID player;
+    private boolean warnedUnparsable;
 
-    PacketFilter(AntiFreeCam plugin) {
+    PacketFilter(AntiFreeCam plugin, UUID player) {
         this.plugin = plugin;
+        this.nms = plugin.nms;
+        this.player = player;
     }
 
     @Override
-    public void onPacketSend(PacketSendEvent event) {
-        UUID id = event.getUser().getUUID();
-        if (id == null || !plugin.hidden.contains(id)) return;
-        PacketTypeCommon type = event.getPacketType();
-        try {
-            if (type == PacketType.Play.Server.CHUNK_DATA && plugin.modifyChunks) chunk(event);
-            else if (type == PacketType.Play.Server.BLOCK_CHANGE && plugin.modifyBlockChanges) blockChange(event);
-            else if (type == PacketType.Play.Server.MULTI_BLOCK_CHANGE && plugin.modifyMultiBlockChanges) multiBlockChange(event);
-            else if (type == PacketType.Play.Server.SPAWN_ENTITY) spawn(event);
-        } catch (RuntimeException e) {
-            if (plugin.debug) plugin.getLogger().warning("Could not filter " + type + ": " + e);
-        }
-    }
-
-    private void chunk(PacketSendEvent event) {
-        BaseChunk[] sections = new WrapperPlayServerChunkData(event).getColumn().getChunks();
-        int minY = event.getUser().getMinWorldHeight();
-        int maxY = plugin.hideBelowY, rep = plugin.replacementId;
-        boolean changed = false;
-        for (int i = 0; i < sections.length; i++) {
-            BaseChunk s = sections[i];
-            int baseY = minY + i * 16;
-            if (s == null || s.isEmpty() || baseY > maxY) continue;
-            int top = Math.min(15, maxY - baseY);
-            for (int y = 0; y <= top; y++)
-                for (int z = 0; z < 16; z++)
-                    for (int x = 0; x < 16; x++)
-                        if (s.getBlockId(x, y, z) != rep) {
-                            s.set(x, y, z, rep);
-                            changed = true;
-                        }
-        }
-        if (changed) event.markForReEncode(true);
-    }
-
-    private void blockChange(PacketSendEvent event) {
-        var w = new WrapperPlayServerBlockChange(event);
-        if (w.getBlockPosition().getY() <= plugin.hideBelowY && w.getBlockId() != plugin.replacementId) {
-            w.setBlockID(plugin.replacementId);
-            event.markForReEncode(true);
-        }
-    }
-
-    private void multiBlockChange(PacketSendEvent event) {
-        boolean changed = false;
-        for (var b : new WrapperPlayServerMultiBlockChange(event).getBlocks()) {
-            if (b.getY() <= plugin.hideBelowY && b.getBlockId() != plugin.replacementId) {
-                b.setBlockId(plugin.replacementId);
-                changed = true;
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        Integer minY = plugin.hidden.get(player);
+        Object out = msg;
+        if (minY != null) {
+            try {
+                out = filter(msg, minY);
+            } catch (RuntimeException e) {
+                if (plugin.debug) plugin.getLogger().warning("Could not filter " + msg.getClass().getSimpleName() + ": " + e);
             }
         }
-        if (changed) event.markForReEncode(true);
+        if (out == null) promise.trySuccess();
+        else ctx.write(out, promise);
     }
 
-    // Metadata/movement for a dropped spawn is ignored by the client, so only the spawn needs filtering.
-    private void spawn(PacketSendEvent event) {
-        var w = new WrapperPlayServerSpawnEntity(event);
-        if (w.getPosition().getY() <= plugin.hideBelowY
-                && plugin.hiddenTypeKeys.contains(w.getEntityType().getName().toString())) {
-            event.setCancelled(true);
+    /** The packet to send in place of {@code msg}, or null to drop it. */
+    private Object filter(Object msg, int minY) {
+        Class<?> type = msg.getClass();
+        int maxY = plugin.hideBelowY;
+        if (type == nms.bundlePacket) return filterBundle(msg, minY);
+        if (type == nms.chunkPacket) return plugin.modifyChunks ? filterChunk(msg, minY, maxY) : msg;
+        // The client already shows the replacement there, so updates at or below the limit can simply be dropped.
+        if (type == nms.blockUpdatePacket) return plugin.modifyBlockChanges && nms.blockUpdateY(msg) <= maxY ? null : msg;
+        if (type == nms.sectionUpdatePacket) return plugin.modifyMultiBlockChanges ? filterSectionUpdate(msg, maxY) : msg;
+        if (type == nms.addEntityPacket)
+            return nms.entityY(msg) <= maxY && plugin.hiddenTypeKeys.contains(nms.entityTypeKey(msg)) ? null : msg;
+        return msg;
+    }
+
+    private Object filterBundle(Object bundle, int minY) {
+        List<Object> parts = new ArrayList<>();
+        boolean changed = false;
+        for (Object part : nms.subPackets(bundle)) {
+            Object filtered = filter(part, minY);
+            changed |= filtered != part;
+            if (filtered == null) continue;
+            if (filtered.getClass() == nms.bundlePacket) parts.addAll(nms.subPackets(filtered)); // bundles can't nest
+            else parts.add(filtered);
         }
+        if (!changed) return bundle;
+        return parts.isEmpty() ? null : nms.bundle(parts);
+    }
+
+    private Object filterChunk(Object packet, int minY, int maxY) {
+        byte[] in = nms.chunkBuffer(packet);
+        byte[] out = ChunkSections.hideBelow(in, minY, maxY, plugin.replacementId, nms::isAir, nms.globalBlockBits);
+        if (out == null) {
+            if (!warnedUnparsable) plugin.getLogger().warning("Unrecognized chunk format, sending chunks unfiltered");
+            warnedUnparsable = true;
+            return packet;
+        }
+        return out == in ? packet : nms.withChunkBuffer(packet, out);
+    }
+
+    /** All changes in one packet share a 16-high section: pass it, drop it, or keep the part above the limit. */
+    private Object filterSectionUpdate(Object packet, int maxY) {
+        int[] lowest = {Integer.MAX_VALUE};
+        nms.forEachChange(packet, (pos, state) -> lowest[0] = Math.min(lowest[0], nms.y(pos)));
+        int sectionBottom = Math.floorDiv(lowest[0], 16) * 16;
+        if (sectionBottom > maxY) return packet;
+        if (sectionBottom + 15 <= maxY) return null;
+        List<Object> kept = new ArrayList<>();
+        nms.forEachChange(packet, (pos, state) -> {
+            if (nms.y(pos) > maxY) kept.add(nms.blockUpdate(pos, state));
+        });
+        return kept.isEmpty() ? null : nms.bundle(kept);
     }
 }

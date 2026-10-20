@@ -1,13 +1,12 @@
 package me.lonaldeu.antifreecam;
 
-import com.github.retrooper.packetevents.PacketEvents;
-import com.github.retrooper.packetevents.event.PacketListenerCommon;
-import com.github.retrooper.packetevents.event.PacketListenerPriority;
-import com.github.retrooper.packetevents.protocol.world.states.WrappedBlockState;
 import com.destroystokyo.paper.event.player.PlayerPostRespawnEvent;
+import io.netty.channel.Channel;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -33,11 +32,11 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     private static final List<String> FALLBACK_TYPES = List.of("ARMOR_STAND", "ITEM_FRAME", "GLOW_ITEM_FRAME", "PAINTING",
             "MINECART", "CHEST_MINECART", "HOPPER_MINECART", "TNT_MINECART", "FURNACE_MINECART", "SPAWNER_MINECART");
 
-    // Players whose view is filtered. Read by the packet filter on netty threads.
-    final Set<UUID> hidden = ConcurrentHashMap.newKeySet();
+    // Players whose view is filtered, mapped to their world's minimum height. Read by the packet filter on netty threads.
+    final Map<UUID, Integer> hidden = new ConcurrentHashMap<>();
     private final Map<UUID, Long> hideCooldownUntil = new ConcurrentHashMap<>();
     final Bedrock bedrock = new Bedrock(this);
-    private PacketListenerCommon packetListener;
+    Nms nms;
 
     // Settings snapshot, read from netty threads too.
     volatile boolean debug;
@@ -57,23 +56,59 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        try {
+            nms = new Nms();
+            nms.setAirIds(Set.of(nms.blockId(Material.AIR.createBlockData()), nms.blockId(Material.CAVE_AIR.createBlockData()),
+                    nms.blockId(Material.VOID_AIR.createBlockData())));
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            getLogger().severe("Unsupported server, Paper 1.20.5 or newer is required: " + e);
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
         saveDefaultConfig();
         loadSettings();
-        packetListener = PacketEvents.getAPI().getEventManager().registerListener(new PacketFilter(this), PacketListenerPriority.NORMAL);
         getServer().getPluginManager().registerEvents(this, this);
         Commands commands = new Commands(this);
         for (String name : List.of("antifreecam", "afcdebug", "afcreload", "afcworld")) {
             getCommand(name).setExecutor(commands);
             getCommand(name).setTabCompleter(commands);
         }
+        getServer().getOnlinePlayers().forEach(this::hook);
         reevaluateAll(true);
     }
 
     @Override
     public void onDisable() {
-        if (packetListener != null) PacketEvents.getAPI().getEventManager().unregisterListener(packetListener);
+        if (nms == null) return;
+        for (Player p : getServer().getOnlinePlayers()) {
+            Channel channel = channel(p);
+            if (channel != null) channel.eventLoop().execute(() -> {
+                if (channel.pipeline().get(PacketFilter.NAME) != null) channel.pipeline().remove(PacketFilter.NAME);
+            });
+        }
         hidden.clear();
         hideCooldownUntil.clear();
+    }
+
+    private Channel channel(Player p) {
+        try {
+            return nms.channel(p);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            getLogger().warning("Could not reach the connection of " + p.getName() + ": " + e);
+            return null;
+        }
+    }
+
+    /** Adds the packet filter to the player's connection, just before the server's own packet handler. */
+    private void hook(Player p) {
+        Channel channel = channel(p);
+        if (channel == null) return;
+        UUID id = p.getUniqueId();
+        channel.eventLoop().execute(() -> {
+            var pipeline = channel.pipeline();
+            if (pipeline.get(PacketFilter.NAME) == null && pipeline.get("packet_handler") != null)
+                pipeline.addBefore("packet_handler", PacketFilter.NAME, new PacketFilter(this, id));
+        });
     }
 
     void loadSettings() {
@@ -102,19 +137,19 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         hiddenTypeKeys = Set.copyOf(keys);
 
         String block = c.getString("performance.replacement.block-type", "air");
-        if (!block.contains(":")) block = "minecraft:" + block;
-        WrappedBlockState state = null;
+        BlockData data;
         try {
-            state = WrappedBlockState.getByString(block);
-        } catch (RuntimeException ignored) {
-        }
-        if (state == null) {
+            data = Bukkit.createBlockData(block);
+        } catch (IllegalArgumentException e) {
             getLogger().warning("Unknown replacement block '" + block + "', using minecraft:air");
-            block = "minecraft:air";
-            state = WrappedBlockState.getByString(block);
+            data = Material.AIR.createBlockData();
         }
-        replacementName = block;
-        replacementId = state.getGlobalId();
+        replacementName = data.getAsString();
+        try {
+            replacementId = nms.blockId(data);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
 
         bedrock.load(c);
     }
@@ -137,7 +172,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     void update(Player p, Location to, boolean refresh) {
         UUID id = p.getUniqueId();
         boolean hide = shouldHide(to);
-        boolean changed = hide ? hidden.add(id) : hidden.remove(id);
+        boolean changed = hide ? hidden.put(id, to.getWorld().getMinHeight()) == null : hidden.remove(id) != null;
         if (!changed && !(refresh && hide)) return;
         if (debug && changed) getLogger().info(p.getName() + (hide ? " is now above ground (hidden view)" : " is now below the protection level (full view)"));
 
@@ -190,7 +225,8 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
-        bedrock.isBedrock(e.getPlayer());
+        bedrock.logJoin(e.getPlayer());
+        hook(e.getPlayer());
         update(e.getPlayer(), e.getPlayer().getLocation(), false);
     }
 
@@ -199,7 +235,6 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         UUID id = e.getPlayer().getUniqueId();
         hidden.remove(id);
         hideCooldownUntil.remove(id);
-        bedrock.forget(id);
     }
 
     @EventHandler(ignoreCancelled = true)

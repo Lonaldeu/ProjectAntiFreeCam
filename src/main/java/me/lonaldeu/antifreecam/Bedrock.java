@@ -5,15 +5,12 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 /** Detects Geyser/Floodgate players so their refresh radius can be smaller. APIs are reached by reflection. */
 final class Bedrock {
 
     private final AntiFreeCam plugin;
-    private final Map<UUID, Boolean> cache = new ConcurrentHashMap<>();
 
     boolean enabled, useGeyser, useFloodgate, useUuid, useNames, logDetection, logMethod;
     List<String> prefixes = List.of();
@@ -35,7 +32,6 @@ final class Bedrock {
         minRadius = c.getInt("bedrock.optimizations.minimum-chunk-radius", 2);
         logDetection = c.getBoolean("bedrock.logging.log-detection", true);
         logMethod = c.getBoolean("bedrock.logging.log-detection-method", false);
-        cache.clear();
     }
 
     int adjustRadius(Player p, int radius) {
@@ -43,21 +39,16 @@ final class Bedrock {
     }
 
     boolean isBedrock(Player p) {
-        if (!enabled) return false;
-        return cache.computeIfAbsent(p.getUniqueId(), id -> {
-            String method = detect(p);
-            if (method != null && logDetection)
-                plugin.getLogger().info("Bedrock player: " + p.getName() + (logMethod ? " (" + method + ")" : ""));
-            return method != null;
-        });
+        return enabled && detect(p) != null;
+    }
+
+    void logJoin(Player p) {
+        String method = enabled && logDetection ? detect(p) : null;
+        if (method != null) plugin.getLogger().info("Bedrock player: " + p.getName() + (logMethod ? " (" + method + ")" : ""));
     }
 
     long onlineCount() {
         return Bukkit.getOnlinePlayers().stream().filter(this::isBedrock).count();
-    }
-
-    void forget(UUID id) {
-        cache.remove(id);
     }
 
     boolean geyserPresent() {

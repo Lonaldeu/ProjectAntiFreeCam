@@ -2,7 +2,7 @@
 
 Paper/Folia plugin that hides underground blocks and entities from players standing above ground, so freecam and x-ray clients see nothing below the configured level.
 
-- Requires [PacketEvents](https://github.com/retrooper/packetevents) 2.10.1+ and Paper 1.20+ (Java 21).
+- Requires Paper (or Folia) 1.20.5+ on Java 21. No other plugins needed: it hooks the server network pipeline itself.
 - Configure in `plugins/ProjectAntiFreeCam/config.yml`.
 - Commands: `/afc <debug|reload|world|stats|test>`, `/afcworld <list|add|remove> [world]`, `/afcdebug`, `/afcreload`. Permission: `antifreecam.admin`.
 

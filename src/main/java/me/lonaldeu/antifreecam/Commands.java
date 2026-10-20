@@ -159,7 +159,7 @@ final class Commands implements TabExecutor {
         switch (args.length > 0 ? args[0].toLowerCase(Locale.ROOT) : "") {
             case "block" -> send(s, "§7Replacement block: §f" + plugin.replacementName + " §7(state id " + plugin.replacementId + ")");
             case "state" -> send(s, String.format("§7Your Y: §f%.1f §7| protection Y: §f%.1f §7| view filtered: §f%s",
-                    p.getY(), plugin.protectionY, plugin.hidden.contains(p.getUniqueId())));
+                    p.getY(), plugin.protectionY, plugin.hidden.containsKey(p.getUniqueId())));
             case "refresh" -> {
                 if (!plugin.worlds.contains(p.getWorld().getName())) {
                     send(s, "§6This world is not protected.");

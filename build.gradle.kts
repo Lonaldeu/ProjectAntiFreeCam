@@ -8,17 +8,29 @@ version = "1.0.0"
 repositories {
     mavenCentral()
     maven("https://repo.papermc.io/repository/maven-public/")
-    maven("https://repo.codemc.io/repository/maven-releases/")
 }
 
 dependencies {
     compileOnly("io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT")
-    compileOnly("com.github.retrooper:packetevents-spigot:2.10.1")
+    // Provided by the server at runtime; only needed to compile the pipeline handler.
+    compileOnly("io.netty:netty-transport:4.1.118.Final")
+
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 tasks.withType<JavaCompile> {
     options.release = 21
     options.encoding = "UTF-8"
+}
+
+tasks.test {
+    useJUnitPlatform()
+}
+
+// Our reflection uses Mojang names; tell Paper not to remap the jar as if it used Spigot's.
+tasks.jar {
+    manifest { attributes("paperweight-mappings-namespace" to "mojang") }
 }
 
 tasks.processResources {

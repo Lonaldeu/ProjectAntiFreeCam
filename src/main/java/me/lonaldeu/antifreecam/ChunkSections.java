@@ -2,8 +2,11 @@ package me.lonaldeu.antifreecam;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.IntPredicate;
 
@@ -20,7 +23,8 @@ final class ChunkSections {
     }
 
     /**
-     * Replaces every block at or below {@code maxY} with {@code replacement}.
+     * Replaces every block at or below {@code maxY} with {@code replacement}. Sections entirely in that range also get
+     * the biomes of the first section above it, so biomes like the deep dark don't give away what's underneath.
      * Returns {@code in} itself when no section reaches that low, or null when the data can't be parsed.
      */
     static byte[] hideBelow(byte[] in, int minY, int maxY, int replacement, IntPredicate isAir, int globalBits) {
@@ -37,31 +41,79 @@ final class ChunkSections {
     }
 
     private static byte[] hideBelow(byte[] in, int minY, int maxY, int replacement, IntPredicate isAir, int globalBits, boolean prefixed) {
+        // First pass: where each section's block and biome containers start, which also validates the layout.
         ByteBuffer r = ByteBuffer.wrap(in);
-        ByteArrayOutputStream out = new ByteArrayOutputStream(in.length);
-        for (int baseY = minY; r.hasRemaining(); baseY += 16) {
+        List<int[]> sections = new ArrayList<>(); // {start, biomesStart, end}
+        while (r.hasRemaining()) {
             int start = r.position();
             r.getShort();
-            if (baseY > maxY) {
-                skipContainer(r, BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
-                skipContainer(r, BIOMES, MAX_INDIRECT_BIOME_BITS, prefixed);
-                out.write(in, start, r.position() - start);
-                continue;
-            }
-            int[] blocks = readContainer(r, BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
+            skipContainer(r, BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
             int biomesStart = r.position();
             skipContainer(r, BIOMES, MAX_INDIRECT_BIOME_BITS, prefixed);
+            sections.add(new int[]{start, biomesStart, r.position()});
+        }
+        int[] donor = null; // biomes for fully hidden sections: those of the first section above the range
+        for (int i = 0; i < sections.size() && donor == null; i++)
+            if (minY + i * 16 > maxY) donor = sections.get(i);
 
-            int rows = Math.min(16, maxY - baseY + 1);
-            Arrays.fill(blocks, 0, rows * 256, replacement);
+        ByteArrayOutputStream out = new ByteArrayOutputStream(in.length);
+        for (int i = 0; i < sections.size(); i++) {
+            int[] s = sections.get(i);
+            int baseY = minY + i * 16;
+            if (baseY > maxY) {
+                out.write(in, s[0], s[2] - s[0]);
+                continue;
+            }
+            if (baseY + 15 <= maxY) {
+                int count = isAir.test(replacement) ? 0 : BLOCKS;
+                out.write(count >> 8);
+                out.write(count);
+                writeBlocks(out, new int[]{replacement}, globalBits, prefixed);
+                int[] biomes = donor != null ? donor : s;
+                out.write(in, biomes[1], biomes[2] - biomes[1]);
+                continue;
+            }
+            // The one section that straddles the limit: rewrite only its lower rows.
+            int[] blocks = readContainer(ByteBuffer.wrap(in, s[0] + 2, s[1] - s[0] - 2), BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
+            Arrays.fill(blocks, 0, (maxY - baseY + 1) * 256, replacement);
             int nonAir = 0;
             for (int id : blocks) if (!isAir.test(id)) nonAir++;
             out.write(nonAir >> 8);
             out.write(nonAir);
             writeBlocks(out, blocks, globalBits, prefixed);
-            out.write(in, biomesStart, r.position() - biomesStart);
+            out.write(in, s[1], s[2] - s[1]);
         }
         return out.toByteArray();
+    }
+
+    /** One light layer (sky or block) of a light packet: which sections have arrays, which are all-dark, and the arrays. */
+    record LightLayer(BitSet mask, BitSet empty, List<byte[]> arrays) {
+    }
+
+    /**
+     * Darkens light at or below {@code maxY}, so torches, lava and cave openings down there can't be located.
+     * Light sections start one section below the world. Sections entirely in range become "all dark"; the one that
+     * straddles the limit gets its lower rows zeroed. The input is left untouched.
+     */
+    static LightLayer hideLight(LightLayer in, int minY, int maxY) {
+        BitSet mask = (BitSet) in.mask().clone(), empty = (BitSet) in.empty().clone();
+        List<byte[]> arrays = new ArrayList<>(in.arrays().size());
+        int next = 0;
+        for (int i = in.mask().nextSetBit(0); i >= 0; i = in.mask().nextSetBit(i + 1)) {
+            byte[] light = in.arrays().get(next++);
+            int baseY = minY - 16 + i * 16;
+            if (baseY > maxY) {
+                arrays.add(light);
+            } else if (baseY + 15 > maxY) {
+                byte[] copy = light.clone();
+                Arrays.fill(copy, 0, (maxY - baseY + 1) * 128, (byte) 0); // two 4-bit values per byte, 256 per row
+                arrays.add(copy);
+            } else {
+                mask.clear(i);
+            }
+        }
+        for (int i = 0; minY - 16 + i * 16 + 15 <= maxY; i++) empty.set(i);
+        return new LightLayer(mask, empty, arrays);
     }
 
     static int[] readContainer(ByteBuffer r, int entries, int maxIndirectBits, boolean prefixed) {
@@ -107,6 +159,7 @@ final class ChunkSections {
         r.position(r.position() + longs * 8);
     }
 
+    /** Writes a block container. A single value stands for a section filled with that block. */
     static void writeBlocks(ByteArrayOutputStream out, int[] values, int globalBits, boolean prefixed) {
         Map<Integer, Integer> palette = new LinkedHashMap<>();
         for (int v : values) palette.putIfAbsent(v, palette.size());

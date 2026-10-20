@@ -9,8 +9,8 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Sits in one player's netty pipeline, ahead of the packet encoder, and rewrites or drops outgoing packets while
- * that player's view is hidden. Runs on the netty event loop: only reads thread-safe plugin state.
+ * Sits in one player's netty pipeline, ahead of the packet encoder, and rewrites or drops outgoing packets that
+ * would show anything in the player's hidden range. Runs on the netty event loop: only reads thread-safe plugin state.
  */
 final class PacketFilter extends ChannelOutboundHandlerAdapter {
 
@@ -29,11 +29,11 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-        Integer minY = plugin.hidden.get(player);
+        AntiFreeCam.View view = plugin.views.get(player);
         Object out = msg;
-        if (minY != null) {
+        if (view != null) {
             try {
-                out = filter(msg, minY);
+                out = filter(msg, view.minY(), view.maxHiddenY());
             } catch (RuntimeException e) {
                 if (plugin.debug) plugin.getLogger().warning("Could not filter " + msg.getClass().getSimpleName() + ": " + e);
             }
@@ -43,24 +43,28 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     }
 
     /** The packet to send in place of {@code msg}, or null to drop it. */
-    private Object filter(Object msg, int minY) {
+    private Object filter(Object msg, int minY, int maxY) {
         Class<?> type = msg.getClass();
-        int maxY = plugin.hideBelowY;
-        if (type == nms.bundlePacket) return filterBundle(msg, minY);
+        if (type == nms.bundlePacket) return filterBundle(msg, minY, maxY);
         if (type == nms.chunkPacket) return plugin.modifyChunks ? filterChunk(msg, minY, maxY) : msg;
         // The client already shows the replacement there, so updates at or below the limit can simply be dropped.
         if (type == nms.blockUpdatePacket) return plugin.modifyBlockChanges && nms.blockUpdateY(msg) <= maxY ? null : msg;
         if (type == nms.sectionUpdatePacket) return plugin.modifyMultiBlockChanges ? filterSectionUpdate(msg, maxY) : msg;
         if (type == nms.addEntityPacket)
             return nms.entityY(msg) <= maxY && plugin.hiddenTypeKeys.contains(nms.entityTypeKey(msg)) ? null : msg;
-        return msg;
+        if (!plugin.stripSideChannels) return msg;
+        if (type == nms.lightUpdatePacket) return nms.withoutLight(msg, minY, maxY);
+        // Biome edits (/fillbiome) are rare; players with a hidden range get the new biomes on their next refresh.
+        if (type == nms.chunksBiomesPacket) return null;
+        Integer y = nms.sideChannelY(msg);
+        return y != null && y <= maxY ? null : msg;
     }
 
-    private Object filterBundle(Object bundle, int minY) {
+    private Object filterBundle(Object bundle, int minY, int maxY) {
         List<Object> parts = new ArrayList<>();
         boolean changed = false;
         for (Object part : nms.subPackets(bundle)) {
-            Object filtered = filter(part, minY);
+            Object filtered = filter(part, minY, maxY);
             changed |= filtered != part;
             if (filtered == null) continue;
             if (filtered.getClass() == nms.bundlePacket) parts.addAll(nms.subPackets(filtered)); // bundles can't nest
@@ -78,7 +82,7 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
             warnedUnparsable = true;
             return packet;
         }
-        return out == in ? packet : nms.withChunkBuffer(packet, out);
+        return out == in ? packet : nms.withChunkBuffer(packet, out, plugin.stripSideChannels, minY, maxY);
     }
 
     /** All changes in one packet share a 16-high section: pass it, drop it, or keep the part above the limit. */

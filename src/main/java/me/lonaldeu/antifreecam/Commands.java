@@ -122,7 +122,9 @@ final class Commands implements TabExecutor {
         send(s, "§3§lStatus");
         s.sendMessage("§eVersion: §a" + plugin.getPluginMeta().getVersion());
         s.sendMessage("§ePlatform: §a" + plugin.platform());
-        s.sendMessage("§ePlayers with filtered view: §a" + plugin.hidden.size());
+        long surface = plugin.views.values().stream().filter(AntiFreeCam.View::surface).count();
+        s.sendMessage("§ePlayers with filtered view: §a" + plugin.views.size() + " §7(" + surface + " above ground, "
+                + (plugin.views.size() - surface) + " depth-limited)");
         s.sendMessage("§eProtected worlds: §a" + plugin.worlds.size());
         s.sendMessage("§eDebug: §a" + (plugin.debug ? "on" : "off"));
         if (!b.enabled) {
@@ -148,8 +150,11 @@ final class Commands implements TabExecutor {
         }
         switch (args.length > 0 ? args[0].toLowerCase(Locale.ROOT) : "") {
             case "block" -> send(s, "§7Replacement block: §f" + plugin.replacementName + " §7(state id " + plugin.replacementId + ")");
-            case "state" -> send(s, String.format("§7Your Y: §f%.1f §7| protection Y: §f%.1f §7| view filtered: §f%s",
-                    p.getY(), plugin.protectionY, plugin.hidden.containsKey(p.getUniqueId())));
+            case "state" -> {
+                AntiFreeCam.View view = plugin.views.get(p.getUniqueId());
+                send(s, String.format("§7Your Y: §f%.1f §7| protection Y: §f%.1f §7| hidden: §f%s", p.getY(), plugin.protectionY,
+                        view == null ? "nothing" : "Y <= " + view.maxHiddenY() + (view.surface() ? " (above ground)" : " (depth limit)")));
+            }
             case "refresh" -> {
                 if (!plugin.worlds.contains(p.getWorld().getName())) {
                     send(s, "§6This world is not protected.");

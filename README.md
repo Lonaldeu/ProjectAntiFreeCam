@@ -5,6 +5,13 @@ Paper/Folia plugin that hides underground blocks and entities from players stand
 - Requires Paper (or Folia) 1.20.5+ on Java 21. No other plugins needed: it hooks the server network pipeline itself.
 - Tested with a bot client on Paper 1.20.6, 1.21.4, 1.21.8, 1.21.11 and Folia 1.21.8. The platform and version are detected at startup and logged.
 - Configure in `plugins/ProjectAntiFreeCam/config.yml`.
+
+How it hides:
+- **Above ground** (Y ≥ 31): nothing at or below Y 16 is sent. The full view returns 2 blocks under Y 31, so jumping on a ledge doesn't flicker.
+- **Underground**: terrain more than 48 blocks below the player isn't sent either, so digging a shaft to Y 30 doesn't reveal the deep underground.
+- In the hidden range the client also gets no light, real biomes, block entities (chests, spawners), block events, mining cracks, sounds, particles or listed entities.
+- Every change of view re-sends the player's chunks; refreshes are rate-limited but never skipped.
+- Ores in the band players *can* see are best covered by Paper's built-in anti-xray (`anticheat.anti-xray` in `paper-world-defaults.yml`).
 - Commands: `/afc <debug|reload|world|stats|test>`, `/afcworld <list|add|remove> [world]`, `/afcdebug`, `/afcreload`. Permission: `antifreecam.admin`.
 
 Build: `./gradlew build` → `build/libs/ProjectAntiFreeCam-<version>.jar`.

@@ -22,6 +22,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,9 +32,17 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     private static final List<String> FALLBACK_TYPES = List.of("ARMOR_STAND", "ITEM_FRAME", "GLOW_ITEM_FRAME", "PAINTING",
             "MINECART", "CHEST_MINECART", "HOPPER_MINECART", "TNT_MINECART", "FURNACE_MINECART", "SPAWNER_MINECART");
 
-    // Players whose view is filtered, mapped to their world's minimum height. Read by the packet filter on netty threads.
-    final Map<UUID, Integer> hidden = new ConcurrentHashMap<>();
-    private final Map<UUID, Long> hideCooldownUntil = new ConcurrentHashMap<>();
+    /**
+     * What a player may not see: everything at or below {@code maxHiddenY}. {@code surface} means the player is above
+     * the protection level; otherwise the cut follows the player's own depth.
+     */
+    record View(int minY, int maxHiddenY, boolean surface) {
+    }
+
+    // Players with a hidden range. Read by the packet filter on netty threads.
+    final Map<UUID, View> views = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> nextRefreshAt = new ConcurrentHashMap<>();
+    private final Set<UUID> refreshQueued = ConcurrentHashMap.newKeySet();
     final Bedrock bedrock = new Bedrock(this);
     Nms nms;
 
@@ -41,13 +50,13 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     volatile boolean debug;
     volatile Set<String> worlds = Set.of();
     volatile boolean protectionEnabled;
-    volatile double protectionY;
-    volatile int hideBelowY;
+    volatile double protectionY, hysteresis;
+    volatile int hideBelowY, viewDepth;
     volatile boolean hideEntities;
     volatile Set<String> hiddenTypeKeys = Set.of(); // "minecraft:zombie"; always contains the player key when hiding entities
     volatile String replacementName;
     volatile int replacementId;
-    volatile boolean modifyChunks, modifyBlockChanges, modifyMultiBlockChanges;
+    volatile boolean modifyChunks, modifyBlockChanges, modifyMultiBlockChanges, stripSideChannels;
     volatile long refreshCooldownMs;
     volatile int maxChunksPerTick;
     volatile boolean limitedArea;
@@ -56,7 +65,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     @Override
     public void onEnable() {
         try {
-            nms = new Nms();
+            nms = new Nms(getLogger());
             nms.setAirIds(Set.of(nms.blockId(Material.AIR.createBlockData()), nms.blockId(Material.CAVE_AIR.createBlockData()),
                     nms.blockId(Material.VOID_AIR.createBlockData())));
         } catch (ReflectiveOperationException | RuntimeException e) {
@@ -86,8 +95,9 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
                 if (channel.pipeline().get(PacketFilter.NAME) != null) channel.pipeline().remove(PacketFilter.NAME);
             });
         }
-        hidden.clear();
-        hideCooldownUntil.clear();
+        views.clear();
+        nextRefreshAt.clear();
+        refreshQueued.clear();
     }
 
     /** E.g. "Folia 1.21.8". All scheduling goes through Paper's region/entity schedulers, which work on both. */
@@ -137,10 +147,12 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         reloadConfig();
         var c = getConfig();
         debug = c.getBoolean("settings.debug-mode", false);
-        refreshCooldownMs = c.getInt("settings.refresh-cooldown-seconds", 3) * 1000L;
+        refreshCooldownMs = Math.round(c.getDouble("settings.refresh-cooldown-seconds", 1) * 1000);
         worlds = Set.copyOf(c.getStringList("worlds.whitelist"));
         protectionY = c.getDouble("antixray.protection-y-level", 31.0);
         hideBelowY = c.getInt("antixray.hide-below-y", 16);
+        hysteresis = Math.max(0, c.getDouble("antixray.hysteresis", 2.0));
+        viewDepth = c.getInt("antixray.underground-view-depth", 48);
         protectionEnabled = c.getBoolean("performance.underground-protection.enabled", true);
         maxChunksPerTick = Math.max(1, c.getInt("performance.max-chunks-per-tick", 50));
         limitedArea = c.getBoolean("performance.limited-area.enabled", false);
@@ -148,6 +160,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         modifyChunks = c.getBoolean("advanced.packet-processing.modify-chunk-data", true);
         modifyBlockChanges = c.getBoolean("advanced.packet-processing.modify-block-changes", true);
         modifyMultiBlockChanges = c.getBoolean("advanced.packet-processing.modify-multi-block-changes", true);
+        stripSideChannels = c.getBoolean("advanced.packet-processing.strip-side-channels", true);
 
         hideEntities = c.getBoolean("entities.hide-entities", true);
         List<String> types = c.getStringList("entities.hidden-types");
@@ -183,39 +196,63 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         }
     }
 
-    boolean shouldHide(Location at) {
-        return protectionEnabled && worlds.contains(at.getWorld().getName()) && at.getY() >= protectionY;
+    /**
+     * The hidden range for a player at {@code at}, given their current one (for hysteresis), or null for none.
+     * <ul>
+     * <li>At or above the protection level: everything at or below hide-below-y. The full view only comes back
+     * once the player is {@code hysteresis} blocks under the protection level, so jumping on a ledge doesn't flicker.</li>
+     * <li>Below it: whole 16-block sections more than underground-view-depth blocks below the player, so digging a
+     * shaft to just under the protection level doesn't reveal the deep underground. Moving up only hides more once
+     * the player is {@code hysteresis} blocks past a section boundary.</li>
+     * </ul>
+     */
+    View viewAt(Location at, View current) {
+        if (!protectionEnabled || !worlds.contains(at.getWorld().getName())) return null;
+        int minY = at.getWorld().getMinHeight();
+        double y = at.getY();
+        boolean wasSurface = current != null && current.surface();
+        if (y >= protectionY || (wasSurface && y >= protectionY - hysteresis)) return new View(minY, hideBelowY, true);
+        if (viewDepth <= 0) return null;
+
+        double reach = y - viewDepth; // the lowest Y this player gets to see, before rounding to sections
+        int cut = Math.floorDiv((int) Math.floor(reach), 16) * 16 - 1;
+        int held = current == null || wasSurface ? minY - 1 : current.maxHiddenY();
+        if (!wasSurface && cut > held && reach < held + 1 + hysteresis) cut = held;
+        cut = Math.min(cut, hideBelowY);
+        return cut < minY ? null : new View(minY, cut, false);
     }
 
     /**
-     * Sets the player's hidden state for the given location. When it changes (or {@code refresh} is set and the
-     * player is hidden) the client's view is re-sent so it matches the new state.
+     * Updates the player's hidden range for the given location. When it changes (or {@code refresh} is set and the
+     * player has one) the client's view is re-sent so it matches.
      */
     void update(Player p, Location to, boolean refresh) {
         UUID id = p.getUniqueId();
-        boolean hide = shouldHide(to);
-        Integer before;
-        if (hide) {
-            int minY = to.getWorld().getMinHeight();
-            before = hidden.put(id, minY);
-            if (before != null && before != minY) refresh = true; // moved to a world with another height range
-        } else {
-            before = hidden.remove(id);
-        }
-        boolean changed = hide == (before == null);
-        if (!changed && !(refresh && hide)) return;
-        if (debug && changed) getLogger().info(p.getName() + (hide ? " is now above ground (hidden view)" : " is now below the protection level (full view)"));
+        View before = views.get(id);
+        View after = viewAt(to, before);
+        if (after == null) views.remove(id);
+        else views.put(id, after);
+        boolean changed = !Objects.equals(before, after);
+        if (!changed && !(refresh && after != null)) return;
+        if (debug && changed) getLogger().info(p.getName() + ": " + (after == null ? "full view"
+                : "hiding Y <= " + after.maxHiddenY() + (after.surface() ? " (above ground)" : " (depth limit)")));
+        requestRefresh(p);
+    }
 
-        if (hide && !refresh) {
-            long now = System.currentTimeMillis();
-            Long until = hideCooldownUntil.get(id);
-            if (until != null && now < until) return; // state is set; new packets are filtered anyway
-            hideCooldownUntil.put(id, now + refreshCooldownMs);
-        }
+    /**
+     * Re-sends the player's view, at most once per refresh cooldown. A request inside the cooldown is never dropped:
+     * it runs when the cooldown ends, using whatever the player's state is by then.
+     */
+    void requestRefresh(Player p) {
+        UUID id = p.getUniqueId();
+        if (!refreshQueued.add(id)) return; // one is already on its way
+        long wait = Math.max(0, nextRefreshAt.getOrDefault(id, 0L) - System.currentTimeMillis());
         p.getScheduler().runDelayed(this, t -> {
+            refreshQueued.remove(id);
+            nextRefreshAt.put(id, System.currentTimeMillis() + refreshCooldownMs);
             refreshView(p);
             resyncEntities(p);
-        }, null, 2);
+        }, () -> refreshQueued.remove(id), 2 + (wait + 49) / 50);
     }
 
     /** Re-sends the chunks around the player, nearest first, spread over ticks. */
@@ -246,7 +283,8 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     // ponytail: assumes entities within 64 blocks share the player's Folia region, schedule per entity if that bites
     void resyncEntities(Player p) {
         if (!hideEntities) return;
-        List<Entity> nearby = p.getNearbyEntities(64, 64, 64);
+        World world = p.getWorld();
+        List<Entity> nearby = p.getNearbyEntities(64, world.getMaxHeight() - world.getMinHeight(), 64);
         for (Entity e : nearby) p.hideEntity(this, e);
         p.getScheduler().runDelayed(this, t -> {
             for (Entity e : nearby) if (e.isValid()) p.showEntity(this, e);
@@ -263,8 +301,9 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
         UUID id = e.getPlayer().getUniqueId();
-        hidden.remove(id);
-        hideCooldownUntil.remove(id);
+        views.remove(id);
+        nextRefreshAt.remove(id);
+        refreshQueued.remove(id);
     }
 
     // Paper fires this before the destination chunks are sent, so the state is right from the first chunk.

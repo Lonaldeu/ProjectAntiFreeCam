@@ -10,13 +10,18 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.BiConsumer;
+import java.util.logging.Logger;
 
 /**
  * Reflection into the server's Mojang-mapped internals (Paper 1.20.5+), so no packet library is needed.
- * Everything is looked up once at startup; a missing member fails there, not mid-game.
+ * Everything is looked up once at startup. The core lookups must succeed; the side-channel ones (light, block
+ * entities, sounds and the like) only switch their own filtering off when missing.
  */
 final class Nms {
 
@@ -32,7 +37,14 @@ final class Nms {
     private final Unsafe unsafe;
     private Set<Integer> airIds = Set.of();
 
-    Nms() throws ReflectiveOperationException {
+    // Side channels; null when this server version doesn't have them.
+    Class<?> lightUpdatePacket, chunksBiomesPacket;
+    private Field chunkLightField, blockEntitiesField, blockEntityYField, lightUpdateDataField;
+    private Field skyMask, blockMask, emptySkyMask, emptyBlockMask, skyArrays, blockArrays;
+    private Field[] lightPacketFields, lightDataFields;
+    private final Map<Class<?>, Method> blockPosOf = new HashMap<>(), yOf = new HashMap<>();
+
+    Nms(Logger log) throws ReflectiveOperationException {
         chunkPacket = Class.forName(GAME + "ClientboundLevelChunkWithLightPacket");
         Class<?> chunkData = Class.forName(GAME + "ClientboundLevelChunkPacketData");
         blockUpdatePacket = Class.forName(GAME + "ClientboundBlockUpdatePacket");
@@ -68,6 +80,40 @@ final class Nms {
         Field f = Unsafe.class.getDeclaredField("theUnsafe");
         f.setAccessible(true);
         unsafe = (Unsafe) f.get(null);
+
+        try {
+            chunkLightField = accessible(chunkPacket.getDeclaredField("lightData"));
+            blockEntitiesField = accessible(chunkData.getDeclaredField("blockEntitiesData"));
+            blockEntityYField = accessible(Class.forName(GAME + "ClientboundLevelChunkPacketData$BlockEntityInfo").getDeclaredField("y"));
+            chunksBiomesPacket = Class.forName(GAME + "ClientboundChunksBiomesPacket");
+            lightUpdatePacket = Class.forName(GAME + "ClientboundLightUpdatePacket");
+            lightUpdateDataField = accessible(lightUpdatePacket.getDeclaredField("lightData"));
+            Class<?> lightData = Class.forName(GAME + "ClientboundLightUpdatePacketData");
+            skyMask = accessible(lightData.getDeclaredField("skyYMask"));
+            blockMask = accessible(lightData.getDeclaredField("blockYMask"));
+            emptySkyMask = accessible(lightData.getDeclaredField("emptySkyYMask"));
+            emptyBlockMask = accessible(lightData.getDeclaredField("emptyBlockYMask"));
+            skyArrays = accessible(lightData.getDeclaredField("skyUpdates"));
+            blockArrays = accessible(lightData.getDeclaredField("blockUpdates"));
+            lightPacketFields = instanceFields(lightUpdatePacket);
+            lightDataFields = instanceFields(lightData);
+            for (String name : List.of("ClientboundBlockEntityDataPacket", "ClientboundBlockEventPacket",
+                    "ClientboundBlockDestructionPacket", "ClientboundLevelEventPacket")) {
+                Class<?> c = Class.forName(GAME + name);
+                blockPosOf.put(c, c.getMethod("getPos"));
+            }
+            for (String name : List.of("ClientboundSoundPacket", "ClientboundLevelParticlesPacket")) {
+                Class<?> c = Class.forName(GAME + name);
+                yOf.put(c, c.getMethod("getY"));
+            }
+        } catch (ReflectiveOperationException e) {
+            log.warning("Light, block entity, sound and particle filtering is unavailable on this version: " + e);
+            lightUpdatePacket = null;
+            chunksBiomesPacket = null;
+            chunkLightField = null;
+            blockPosOf.clear();
+            yOf.clear();
+        }
     }
 
     void setAirIds(Set<Integer> ids) {
@@ -94,13 +140,55 @@ final class Nms {
         return (byte[]) get(chunkBufferField, get(chunkDataField, packet));
     }
 
-    /** A copy of the chunk packet carrying different section data. The original may be shared with other players. */
-    Object withChunkBuffer(Object packet, byte[] buffer) {
+    /**
+     * A copy of the chunk packet with different section data. The original may be shared with other players.
+     * With {@code sideChannels}, block entities and light at or below {@code maxY} are removed too.
+     */
+    Object withChunkBuffer(Object packet, byte[] buffer, boolean sideChannels, int minY, int maxY) {
         Object data = copy(get(chunkDataField, packet), chunkDataFields);
         set(chunkBufferField, data, buffer);
         Object copy = copy(packet, chunkPacketFields);
         set(chunkDataField, copy, data);
+        if (sideChannels && chunkLightField != null) {
+            List<Object> kept = new ArrayList<>();
+            for (Object info : (List<?>) get(blockEntitiesField, data))
+                if ((int) get(blockEntityYField, info) > maxY) kept.add(info);
+            set(blockEntitiesField, data, kept);
+            set(chunkLightField, copy, hideLight(get(chunkLightField, packet), minY, maxY));
+        }
         return copy;
+    }
+
+    /** A copy of a light update packet with the light at or below {@code maxY} removed, or the packet itself. */
+    Object withoutLight(Object packet, int minY, int maxY) {
+        if (lightUpdatePacket == null) return packet;
+        Object copy = copy(packet, lightPacketFields);
+        set(lightUpdateDataField, copy, hideLight(get(lightUpdateDataField, packet), minY, maxY));
+        return copy;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object hideLight(Object lightData, int minY, int maxY) {
+        Object copy = copy(lightData, lightDataFields);
+        var sky = ChunkSections.hideLight(new ChunkSections.LightLayer((BitSet) get(skyMask, lightData),
+                (BitSet) get(emptySkyMask, lightData), (List<byte[]>) get(skyArrays, lightData)), minY, maxY);
+        var blocks = ChunkSections.hideLight(new ChunkSections.LightLayer((BitSet) get(blockMask, lightData),
+                (BitSet) get(emptyBlockMask, lightData), (List<byte[]>) get(blockArrays, lightData)), minY, maxY);
+        set(skyMask, copy, sky.mask());
+        set(emptySkyMask, copy, sky.empty());
+        set(skyArrays, copy, sky.arrays());
+        set(blockMask, copy, blocks.mask());
+        set(emptyBlockMask, copy, blocks.empty());
+        set(blockArrays, copy, blocks.arrays());
+        return copy;
+    }
+
+    /** The Y of a position-only packet (block entity data, block events, mining cracks, level events, sounds, particles), else null. */
+    Integer sideChannelY(Object packet) {
+        Method pos = blockPosOf.get(packet.getClass());
+        if (pos != null) return y(call(pos, packet));
+        Method y = yOf.get(packet.getClass());
+        return y == null ? null : (int) Math.floor((double) call(y, packet));
     }
 
     int blockUpdateY(Object packet) {

@@ -1,8 +1,9 @@
 settings:
   # Log state changes to the console.
   debug-mode: false
-  # Minimum seconds between view refreshes when a player rises above the protection level.
-  refresh-cooldown-seconds: 3
+  # Minimum seconds between two view refreshes for one player. A refresh asked for sooner is
+  # delayed until the cooldown ends, never skipped.
+  refresh-cooldown-seconds: 1
 
 worlds:
   # Worlds where protection applies (exact, case-sensitive names).
@@ -16,6 +17,12 @@ antixray:
   protection-y-level: 31.0
   # Blocks and entities at or below this Y are hidden from above-ground players.
   hide-below-y: 16
+  # Above-ground players get the full view back only this many blocks under protection-y-level,
+  # so jumping around on a ledge doesn't make the view flicker.
+  hysteresis: 2.0
+  # Players under protection-y-level still don't get terrain more than this many blocks below
+  # themselves (rounded to 16-block sections). Stops "dig a shaft to Y 30 and look down". 0 = off.
+  underground-view-depth: 48
 
 entities:
   hide-entities: true
@@ -120,6 +127,9 @@ advanced:
     modify-chunk-data: true
     modify-block-changes: true
     modify-multi-block-changes: true
+    # Also hide what gives away hidden areas: light (torches, lava), biomes (deep dark),
+    # block entities (chests, spawners), block events, mining cracks, sounds and particles.
+    strip-side-channels: true
 
 bedrock:
   enabled: true

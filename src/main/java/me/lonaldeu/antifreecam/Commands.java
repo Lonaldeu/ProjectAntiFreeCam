@@ -119,10 +119,9 @@ final class Commands implements TabExecutor {
     private void stats(CommandSender s) {
         if (denied(s, "antifreecam.admin")) return;
         Bedrock b = plugin.bedrock;
-        boolean folia = classExists("io.papermc.paper.threadedregions.RegionizedServer");
         send(s, "§3§lStatus");
         s.sendMessage("§eVersion: §a" + plugin.getPluginMeta().getVersion());
-        s.sendMessage("§ePlatform: §a" + (folia ? "Folia" : "Paper"));
+        s.sendMessage("§ePlatform: §a" + plugin.platform());
         s.sendMessage("§ePlayers with filtered view: §a" + plugin.hidden.size());
         s.sendMessage("§eProtected worlds: §a" + plugin.worlds.size());
         s.sendMessage("§eDebug: §a" + (plugin.debug ? "on" : "off"));
@@ -139,15 +138,6 @@ final class Commands implements TabExecutor {
 
     private static String mark(boolean on) {
         return on ? "§a✓" : "§c✗";
-    }
-
-    private static boolean classExists(String name) {
-        try {
-            Class.forName(name);
-            return true;
-        } catch (ClassNotFoundException e) {
-            return false;
-        }
     }
 
     private void test(CommandSender s, String[] args) {

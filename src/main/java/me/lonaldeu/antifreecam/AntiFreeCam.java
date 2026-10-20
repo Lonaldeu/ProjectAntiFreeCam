@@ -14,7 +14,6 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -65,6 +64,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
+        getLogger().info("Running on " + platform());
         saveDefaultConfig();
         loadSettings();
         getServer().getPluginManager().registerEvents(this, this);
@@ -73,7 +73,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
             getCommand(name).setExecutor(commands);
             getCommand(name).setTabCompleter(commands);
         }
-        getServer().getOnlinePlayers().forEach(this::hook);
+        getServer().getOnlinePlayers().forEach(this::track);
         reevaluateAll(true);
     }
 
@@ -90,6 +90,18 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         hideCooldownUntil.clear();
     }
 
+    /** E.g. "Folia 1.21.8". All scheduling goes through Paper's region/entity schedulers, which work on both. */
+    String platform() {
+        boolean folia;
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            folia = true;
+        } catch (ClassNotFoundException e) {
+            folia = false;
+        }
+        return (folia ? "Folia " : "Paper ") + Bukkit.getMinecraftVersion();
+    }
+
     private Channel channel(Player p) {
         try {
             return nms.channel(p);
@@ -97,6 +109,16 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
             getLogger().warning("Could not reach the connection of " + p.getName() + ": " + e);
             return null;
         }
+    }
+
+    /**
+     * Hooks the player's connection and re-checks their position every tick on their own scheduler. Polling catches
+     * every way of moving (walking, /tp, plugin teleports, portals, respawns) the same way on Paper and Folia, where
+     * async teleports fire no teleport event. The task ends by itself when the player leaves.
+     */
+    private void track(Player p) {
+        hook(p);
+        p.getScheduler().runAtFixedRate(this, t -> update(p, p.getLocation(), false), null, 1, 1);
     }
 
     /** Adds the packet filter to the player's connection, just before the server's own packet handler. */
@@ -172,7 +194,15 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     void update(Player p, Location to, boolean refresh) {
         UUID id = p.getUniqueId();
         boolean hide = shouldHide(to);
-        boolean changed = hide ? hidden.put(id, to.getWorld().getMinHeight()) == null : hidden.remove(id) != null;
+        Integer before;
+        if (hide) {
+            int minY = to.getWorld().getMinHeight();
+            before = hidden.put(id, minY);
+            if (before != null && before != minY) refresh = true; // moved to a world with another height range
+        } else {
+            before = hidden.remove(id);
+        }
+        boolean changed = hide == (before == null);
         if (!changed && !(refresh && hide)) return;
         if (debug && changed) getLogger().info(p.getName() + (hide ? " is now above ground (hidden view)" : " is now below the protection level (full view)"));
 
@@ -226,7 +256,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
         bedrock.logJoin(e.getPlayer());
-        hook(e.getPlayer());
+        track(e.getPlayer());
         update(e.getPlayer(), e.getPlayer().getLocation(), false);
     }
 
@@ -237,11 +267,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         hideCooldownUntil.remove(id);
     }
 
-    @EventHandler(ignoreCancelled = true)
-    public void onMove(PlayerMoveEvent e) {
-        if (e.getFrom().getY() != e.getTo().getY()) update(e.getPlayer(), e.getTo(), false);
-    }
-
+    // Paper fires this before the destination chunks are sent, so the state is right from the first chunk.
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onTeleport(PlayerTeleportEvent e) {
         update(e.getPlayer(), e.getTo(), false);

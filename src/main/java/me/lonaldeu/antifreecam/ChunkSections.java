@@ -22,6 +22,8 @@ final class ChunkSections {
     // Before 1.21.5 each container's long array was prefixed with its length. Both layouts are accepted; the one that
     // worked last is tried first, so a server pays for the wrong guess only once.
     private static volatile boolean prefixedFirst;
+    // Since Minecraft 26.1 a section has a fluid count after its block count. Set once from the server's internals.
+    static volatile boolean fluidCounts;
 
     private ChunkSections() {
     }
@@ -68,49 +70,58 @@ final class ChunkSections {
             int baseY = minY + i * 16;
             boolean masked = masked(occludedMask, i);
             if (baseY > maxY && !masked) {
-                out.write(in, s[0], s[2] - s[0]);
+                out.write(in, s[0], s[3] - s[0]);
                 continue;
             }
             if (baseY + 15 <= maxY || baseY > maxY) { // fully under the cut, or occluded above it: one block throughout
                 int block = baseY > maxY ? occluded : replacement;
-                int count = isAir.test(block) ? 0 : BLOCKS;
-                out.write(count >> 8);
-                out.write(count);
+                writeCounts(out, isAir.test(block) ? 0 : BLOCKS, in, s);
                 writeBlocks(out, new int[]{block}, globalBits, prefixed);
-                out.write(in, donor[1], donor[2] - donor[1]);
+                out.write(in, donor[2], donor[3] - donor[2]);
                 continue;
             }
             // The one section that straddles the cut: its lower rows become the replacement.
             int[] blocks = new int[BLOCKS];
             if (masked) Arrays.fill(blocks, occluded);
-            else blocks = readContainer(ByteBuffer.wrap(in, s[0] + 2, s[1] - s[0] - 2), BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
+            else blocks = readContainer(ByteBuffer.wrap(in, s[1], s[2] - s[1]), BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
             Arrays.fill(blocks, 0, (maxY - baseY + 1) * 256, replacement);
             int nonAir = 0;
             for (int id : blocks) if (!isAir.test(id)) nonAir++;
-            out.write(nonAir >> 8);
-            out.write(nonAir);
+            writeCounts(out, nonAir, in, s);
             writeBlocks(out, blocks, globalBits, prefixed);
             int[] biomes = masked ? donor : s;
-            out.write(in, biomes[1], biomes[2] - biomes[1]);
+            out.write(in, biomes[2], biomes[3] - biomes[2]);
         }
         return out.toByteArray();
+    }
+
+    /**
+     * A section's header: its non-air block count and, since 26.1, its fluid count. The original fluid count is
+     * kept; replacing blocks only removes fluids, and a count that is too high just costs the client a little work.
+     */
+    private static void writeCounts(ByteArrayOutputStream out, int nonAir, byte[] in, int[] section) {
+        out.write(nonAir >> 8);
+        out.write(nonAir);
+        if (fluidCounts) out.write(in, section[0] + 2, 2);
     }
 
     private static boolean masked(long mask, int section) {
         return section < 64 && (mask >> section & 1) != 0;
     }
 
-    /** Where each section's block and biome containers start ({start, biomesStart, end}); also validates the layout. */
+    /** Where each section's parts start ({start, blocksStart, biomesStart, end}); also validates the layout. */
     private static List<int[]> sections(byte[] in, boolean prefixed) {
         ByteBuffer r = ByteBuffer.wrap(in);
         List<int[]> sections = new ArrayList<>();
         while (r.hasRemaining()) {
             int start = r.position();
-            r.getShort();
+            r.getShort(); // non-air block count
+            if (fluidCounts) r.getShort();
+            int blocksStart = r.position();
             skipContainer(r, BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
             int biomesStart = r.position();
             skipContainer(r, BIOMES, MAX_INDIRECT_BIOME_BITS, prefixed);
-            sections.add(new int[]{start, biomesStart, r.position()});
+            sections.add(new int[]{start, blocksStart, biomesStart, r.position()});
         }
         return sections;
     }
@@ -139,8 +150,9 @@ final class ChunkSections {
     }
 
     private static long connectivity(byte[] in, int[] section, IntPredicate opaque, boolean prefixed) {
-        ByteBuffer r = ByteBuffer.wrap(in, section[0], section[1] - section[0]);
+        ByteBuffer r = ByteBuffer.wrap(in, section[0], section[2] - section[0]);
         if (r.getShort() == 0) return Occlusion.ALL; // nothing but air
+        r.position(section[1]);
         return blockConnectivity(r, opaque, prefixed);
     }
 

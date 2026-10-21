@@ -40,9 +40,11 @@ for target in "$@"; do
   echo eula=true > "$dir/eula.txt"
   echo "[{\"uuid\":\"$uuid\",\"name\":\"AfcBot\",\"level\":4,\"bypassesPlayerLimit\":false}]" > "$dir/ops.json"
 
+  java=21
+  [ "${version%%.*}" -ge 26 ] && java=25 # Minecraft 26.x needs Java 25
   docker rm -f afc-e2e >/dev/null 2>&1
   MSYS_NO_PATHCONV=1 docker run -d --name afc-e2e -p 25566:25565 -v "$here/$dir:/w" -w /w \
-    eclipse-temurin:21-jre java -Xmx2G -jar server.jar --nogui >/dev/null
+    eclipse-temurin:$java-jre java -Xmx2G -jar server.jar --nogui >/dev/null
   for _ in $(seq 1 120); do docker logs afc-e2e 2>&1 | grep -q 'Done (' && break; sleep 3; done
 
   echo "===== $target"

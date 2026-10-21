@@ -172,6 +172,42 @@ class ChunkSectionsTest {
         assertArrayEquals(new long[]{Occlusion.pairs(W | E)}, connectivity(prefixed, blocks));
     }
 
+    /** Since 26.1 each section has a fluid count after the block count; it is kept on rewritten sections. */
+    @Test
+    void handlesTheFluidCountLayout() {
+        ChunkSections.fluidCounts = true;
+        try {
+            int[] blocks = new int[4096];
+            for (int i = 0; i < blocks.length; i++) blocks[i] = 1 + i % 20;
+            ByteArrayOutputStream chunk = new ByteArrayOutputStream();
+            for (int i = 0; i < 3; i++) chunk.writeBytes(withFluidCount(section(blocks, false), 0x0123));
+
+            ByteBuffer r = ByteBuffer.wrap(ChunkSections.hideBelow(chunk.toByteArray(), -16, 4, 0, AIR, STONE, IS_AIR, GLOBAL_BITS));
+            assertEquals(0, r.getShort());
+            assertEquals(0x0123, r.getShort());
+            assertArrayEquals(new int[4096], read(r, false));
+            assertEquals(4096 - 5 * 256, r.getShort());
+            assertEquals(0x0123, r.getShort());
+
+            int[] tunnel = stone();
+            for (int x = 0; x < 16; x++) tunnel[cell(x, 8, 8)] = AIR;
+            assertArrayEquals(new long[]{Occlusion.pairs(W | E)},
+                    ChunkSections.connectivity(withFluidCount(section(tunnel, false), 0), OPAQUE));
+        } finally {
+            ChunkSections.fluidCounts = false;
+        }
+    }
+
+    /** Inserts a fluid count after a section's block count. */
+    private static byte[] withFluidCount(byte[] section, int fluids) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(section, 0, 2);
+        out.write(fluids >> 8);
+        out.write(fluids);
+        out.write(section, 2, section.length - 2);
+        return out.toByteArray();
+    }
+
     @Test
     void connectivityOfGarbageIsNull() {
         assertNull(ChunkSections.connectivity(new byte[]{1, 2, 3}, OPAQUE));

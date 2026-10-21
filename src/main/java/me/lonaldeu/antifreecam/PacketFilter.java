@@ -38,7 +38,7 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     private UUID worldId; // event loop only: world of the last posted eye, for re-sends and recomputes
     private Object dimension; // event loop only: the dimension of the chunks the client holds
     private volatile Eye posted;
-    private boolean warnedUnparsable;
+    private boolean warnedUnparsable, warnedFailure;
 
     /** Created on the player's own thread, before the filter is in the pipeline. */
     PacketFilter(AntiFreeCam plugin, Player player, Channel channel) {
@@ -110,8 +110,11 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
                 occlusion.view(view.minY(), view.maxHiddenY(), view.occlude() && track);
                 out = filter(msg, view.minY(), view.maxHiddenY());
             }
-        } catch (RuntimeException e) {
-            if (plugin.debug) plugin.getLogger().warning("Could not filter " + msg.getClass().getSimpleName() + ": " + e);
+        } catch (RuntimeException e) { // the packet goes out unfiltered, so say so at least once
+            if (plugin.debug || !warnedFailure) plugin.getLogger().warning("Could not filter " + msg.getClass().getSimpleName()
+                    + " for " + player.getName() + ", sending it unfiltered: " + e
+                    + (plugin.debug ? "" : " (further failures only show with /afc debug)"));
+            warnedFailure = true;
         }
         if (out == null) promise.trySuccess();
         else ctx.write(out, promise);

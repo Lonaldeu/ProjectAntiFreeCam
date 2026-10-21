@@ -25,7 +25,7 @@ and entities are never sent to the client, so there is nothing for a modified cl
 
 ## Requirements
 
-- Paper or Folia **1.20.5 or newer**, Java 21.
+- Paper or Folia **1.20.5 or newer**, including Minecraft 26.x. Java 21 (Java 25 for 26.x, as Minecraft itself needs).
 - Nothing else. Geyser and Floodgate are optional.
 
 ## Installation
@@ -97,9 +97,14 @@ Spectators also skip line-of-sight culling and cave occlusion, but not the heigh
 
 ## Compatibility
 
-Checked with the end-to-end test below on Paper 1.20.6, 1.21.4, 1.21.8, 1.21.11 and Folia 1.21.8. The plugin reads
-server internals that can change between Minecraft versions; if something it needs is missing it logs which feature is
-off, and if a core part is missing it disables itself with a clear error.
+Checked with the end-to-end test below on Paper 1.20.6, 1.21.4, 1.21.8, 1.21.11, 26.1.2 and Folia 1.21.8, and by hand
+on Paper 26.3. The plugin reads server internals that can change between Minecraft versions; if something it needs is
+missing it logs which feature is off, and if a core part is missing it disables itself with a clear error.
+
+A second after starting, it also runs one real chunk through its whole filter and logs the result:
+`Self-check passed: chunks are filtered on this server version`. If a new Minecraft version breaks something, that line
+says `Self-check FAILED` with the reason instead of chunks quietly going out unfiltered. If filtering ever fails for a
+player later on, that is logged too.
 
 Not tested yet: ViaVersion, real Bedrock clients, and large player counts.
 

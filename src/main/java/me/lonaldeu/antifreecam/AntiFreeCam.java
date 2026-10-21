@@ -103,6 +103,31 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         }
         getServer().getOnlinePlayers().forEach(this::track);
         reevaluateAll(true);
+        Bukkit.getGlobalRegionScheduler().runDelayed(this, t -> selfCheck(), 20);
+    }
+
+    /** Filters one real chunk of the first world and reports whether this server version is handled. */
+    private void selfCheck() {
+        World world = getServer().getWorlds().get(0);
+        Location spawn = world.getSpawnLocation();
+        int x = spawn.getBlockX() >> 4, z = spawn.getBlockZ() >> 4;
+        // Spawn chunks aren't kept loaded any more (26.x), so load the one to check first.
+        world.getChunkAtAsync(x, z).thenRun(() -> Bukkit.getRegionScheduler().execute(this, world, x, z, () -> {
+            Object packet;
+            try {
+                packet = nms.chunkPacket(world, x, z);
+            } catch (RuntimeException e) {
+                getLogger().warning("Self-check skipped: " + e);
+                return;
+            }
+            if (packet == null) {
+                getLogger().warning("Self-check skipped: the spawn chunk isn't loaded");
+                return;
+            }
+            String problem = nms.selfCheck(packet, world.getMinHeight(), replacementId, occludedId);
+            if (problem == null) getLogger().info("Self-check passed: chunks are filtered on this server version");
+            else getLogger().severe("Self-check FAILED, chunks would be sent unfiltered on this server version: " + problem);
+        }));
     }
 
     @Override

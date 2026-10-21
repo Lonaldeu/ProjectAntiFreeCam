@@ -1,13 +1,17 @@
 package me.lonaldeu.antifreecam;
 
 import org.bukkit.GameMode;
+import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.util.BoundingBox;
 import org.bukkit.util.Vector;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -23,22 +27,51 @@ import java.util.concurrent.ThreadLocalRandom;
  * reaches its centre, head or hitbox corners without passing through a full solid block (anti-ESP).</li>
  * </ul>
  * Because it re-checks continuously, entities that cross the cut after spawning are caught too. Spawns the packet
- * filter dropped are reported here, so they get sent once the entity becomes visible.
+ * filter dropped are reported here, so they get sent once the entity becomes visible. Hidden entities' ids and
+ * positions are published for the packet filter, which drops sounds and particles that would give them away.
  */
 final class EntityVisibility {
 
     private static final long TAB_KEEP_MS = 1000;
     private static final double MAX_PREDICTED_STEP = 3; // blocks per check; more is a teleport, not movement
+    // Something that was in sight is hidden only after this many checks out of sight, so walking past pillars
+    // doesn't despawn and respawn it constantly. New arrivals behind a wall are hidden at once.
+    private static final int HIDE_AFTER_CHECKS = 3;
+    // A line-of-sight answer is reused while neither side changed block: "in sight" for this many checks (twice as
+    // long when far); "out of sight" is re-checked every time up close, so an opened wall shows what's behind at once.
+    private static final int REUSE_CHECKS = 4;
+    private static final double FAR = 32;
+    private static final double GIVEAWAY_RADIUS = 2; // a sound this close to an entity is probably its own
+
+    /** What the visibility pass knows about one viewer. */
+    private static final class Viewer {
+        final Set<UUID> hidden = ConcurrentHashMap.newKeySet(); // entities we hid via the API
+        final Set<UUID> droppedSpawns = ConcurrentHashMap.newKeySet(); // reported from netty threads
+        final Map<UUID, Long> keepInTab = new ConcurrentHashMap<>(); // player -> until when to keep in the tab list
+        final Map<UUID, Sight> sight = new HashMap<>(); // viewer's own thread only
+        volatile int[] hiddenIds = new int[0]; // read by netty threads
+        volatile double[] positions = new double[0]; // x, y, z, hidden (1 or 0) per nearby entity; read by netty threads
+        Vector lastEye;
+        int check;
+    }
+
+    /** The last line-of-sight answer for one entity, and what it was computed from. */
+    private static final class Sight {
+        long viewerBlock, entityBlock;
+        int computedAt; // 0 = never
+        boolean clear, wasInSight;
+        int checksOutOfSight;
+    }
 
     private final AntiFreeCam plugin;
-    private final Map<UUID, Set<UUID>> hiddenFor = new ConcurrentHashMap<>(); // viewer -> entities we hid via the API
-    private final Map<UUID, Set<UUID>> droppedSpawns = new ConcurrentHashMap<>(); // viewer -> spawns the filter dropped
-    // viewer -> player -> until when the tab-list removal caused by our own hide is suppressed
-    private final Map<UUID, Map<UUID, Long>> keepInTab = new ConcurrentHashMap<>();
-    private final Map<UUID, Vector> lastEye = new ConcurrentHashMap<>();
+    private final Map<UUID, Viewer> viewers = new ConcurrentHashMap<>();
 
     EntityVisibility(AntiFreeCam plugin) {
         this.plugin = plugin;
+    }
+
+    private Viewer viewer(UUID id) {
+        return viewers.computeIfAbsent(id, k -> new Viewer());
     }
 
     void start(Player viewer) {
@@ -54,68 +87,131 @@ final class EntityVisibility {
 
     /** Called from netty threads when the packet filter drops an entity's spawn for {@code viewer}. */
     void spawnDropped(UUID viewer, UUID entity) {
-        droppedSpawns.computeIfAbsent(viewer, k -> ConcurrentHashMap.newKeySet()).add(entity);
+        viewer(viewer).droppedSpawns.add(entity);
     }
 
     /** Whether a tab-list removal of {@code player} sent to {@code viewer} was caused by our own hide. Netty-thread safe. */
     boolean shouldKeepInTab(UUID viewer, UUID player) {
-        Map<UUID, Long> keep = keepInTab.get(viewer);
-        if (keep == null) return false;
-        Long until = keep.remove(player);
+        Viewer v = viewers.get(viewer);
+        Long until = v == null ? null : v.keepInTab.remove(player);
         return until != null && System.currentTimeMillis() < until;
     }
 
-    void forget(UUID viewer) {
-        hiddenFor.remove(viewer);
-        droppedSpawns.remove(viewer);
-        keepInTab.remove(viewer);
-        lastEye.remove(viewer);
+    /**
+     * Whether a sound or particle packet would give away an entity hidden from {@code viewer}: an entity sound of a
+     * hidden entity, or a positional one whose nearest entity (within a couple of blocks) is hidden. Netty-thread safe.
+     */
+    boolean givesAwayHidden(UUID viewer, Object packet) {
+        Viewer v = viewers.get(viewer);
+        if (v == null || v.hiddenIds.length == 0) return false;
+        Integer id = plugin.nms.soundEntityId(packet);
+        if (id != null) {
+            for (int hidden : v.hiddenIds) if (hidden == id) return true;
+            return false;
+        }
+        double[] at = plugin.nms.soundOrParticlePosition(packet);
+        if (at == null) return false;
+        double[] p = v.positions;
+        double nearest = GIVEAWAY_RADIUS * GIVEAWAY_RADIUS;
+        boolean hidden = false;
+        for (int i = 0; i < p.length; i += 4) {
+            double dx = p[i] - at[0], dy = p[i + 1] - at[1], dz = p[i + 2] - at[2], d = dx * dx + dy * dy + dz * dz;
+            if (d <= nearest) {
+                nearest = d;
+                hidden = p[i + 3] != 0;
+            }
+        }
+        return hidden;
     }
 
-    private void check(Player viewer) {
-        UUID viewerId = viewer.getUniqueId();
-        Set<UUID> hidden = hiddenFor.computeIfAbsent(viewerId, k -> ConcurrentHashMap.newKeySet());
-        Set<UUID> dropped = droppedSpawns.computeIfAbsent(viewerId, k -> ConcurrentHashMap.newKeySet());
-        World world = viewer.getWorld();
-        AntiFreeCam.View view = plugin.views.get(viewerId);
+    void forget(UUID viewer) {
+        viewers.remove(viewer);
+    }
+
+    private void check(Player player) {
+        Viewer v = viewer(player.getUniqueId());
+        int check = ++v.check;
+        World world = player.getWorld();
+        AntiFreeCam.View view = plugin.views.get(player.getUniqueId());
         boolean depth = plugin.hideEntities && view != null;
-        boolean sight = plugin.lineOfSight && plugin.worlds.contains(world.getName())
-                && viewer.getGameMode() != GameMode.SPECTATOR && !viewer.hasPermission("antifreecam.bypass");
-        Vector eye = viewer.getEyeLocation().toVector();
-        Vector predicted = sight ? predictEye(viewer, world, eye) : null;
+        boolean sightRule = plugin.lineOfSight && plugin.worlds.contains(world.getName())
+                && player.getGameMode() != GameMode.SPECTATOR && !player.hasPermission("antifreecam.bypass");
+        Vector eye = player.getEyeLocation().toVector();
+        Vector predicted = sightRule ? predictEye(player, v, world, eye) : null;
+        long eyeBlock = blockKey(eye.getBlockX(), eye.getBlockY(), eye.getBlockZ());
 
         double r = plugin.losMaxDistance;
         Set<UUID> seen = new HashSet<>();
-        for (Entity e : viewer.getNearbyEntities(r, r, r)) {
+        List<Integer> hiddenIds = new ArrayList<>();
+        List<Location> nearbyAt = new ArrayList<>();
+        List<Boolean> nearbyHidden = new ArrayList<>();
+        for (Entity e : player.getNearbyEntities(r, r, r)) {
             if (!plugin.trackedTypeKeys.contains(e.getType().getKey().toString())) continue;
             UUID id = e.getUniqueId();
             seen.add(id);
-            boolean spawnWasDropped = dropped.remove(id);
-            boolean hide = (depth && e.getLocation().getY() <= view.maxHiddenY())
-                    || (sight && !exempt(viewer, e) && !canSee(world, eye, e.getBoundingBox())
-                    && (predicted == null || !canSee(world, predicted, e.getBoundingBox())));
+            boolean spawnWasDropped = v.droppedSpawns.remove(id);
+            Location at = e.getLocation();
+            boolean hide = depth && at.getY() <= view.maxHiddenY();
+            if (hide) v.sight.remove(id); // out of the picture: start fresh when it comes back above the cut
+            else if (sightRule && !exempt(player, e)) {
+                Sight s = v.sight.computeIfAbsent(id, k -> new Sight());
+                long entityBlock = blockKey(at.getBlockX(), at.getBlockY(), at.getBlockZ());
+                boolean far = at.toVector().distanceSquared(eye) > FAR * FAR;
+                int maxAge = s.clear ? (far ? 2 * REUSE_CHECKS : REUSE_CHECKS) : (far ? 2 : 1);
+                if (s.computedAt == 0 || s.viewerBlock != eyeBlock || s.entityBlock != entityBlock || check - s.computedAt >= maxAge) {
+                    BoundingBox box = e.getBoundingBox();
+                    s.clear = canSee(world, eye, box) || (predicted != null && canSee(world, predicted, box));
+                    s.viewerBlock = eyeBlock;
+                    s.entityBlock = entityBlock;
+                    s.computedAt = check;
+                }
+                if (s.clear) {
+                    s.wasInSight = true;
+                    s.checksOutOfSight = 0;
+                } else {
+                    s.checksOutOfSight++;
+                    hide = !s.wasInSight || s.checksOutOfSight >= HIDE_AFTER_CHECKS;
+                }
+            }
+            nearbyAt.add(at);
+            nearbyHidden.add(hide);
             if (hide) {
-                if (hidden.add(id)) hideKeepingTab(viewer, e);
-            } else if (hidden.remove(id)) {
-                viewer.showEntity(plugin, e);
+                if (v.hidden.add(id)) hideKeepingTab(player, v, e);
+                hiddenIds.add(e.getEntityId());
+            } else if (v.hidden.remove(id)) {
+                player.showEntity(plugin, e);
             } else if (spawnWasDropped) { // the client never got this entity: have the server send it now
-                hideKeepingTab(viewer, e);
-                viewer.showEntity(plugin, e);
+                hideKeepingTab(player, v, e);
+                player.showEntity(plugin, e);
             }
         }
-        // ponytail: entities that left range stay marked until seen again (the server keeps its own hidden record too)
-        if (hidden.size() > 1024) hidden.retainAll(seen);
-        if (dropped.size() > 1024) dropped.clear();
+        v.sight.keySet().retainAll(seen);
+        // shortcut: entities that left range stay marked until seen again (the server keeps its own hidden record too)
+        if (v.hidden.size() > 1024) v.hidden.retainAll(seen);
+        if (v.droppedSpawns.size() > 1024) v.droppedSpawns.clear();
+
+        v.hiddenIds = hiddenIds.stream().mapToInt(Integer::intValue).toArray();
+        double[] positions = new double[nearbyAt.size() * 4];
+        for (int i = 0; i < nearbyAt.size(); i++) {
+            positions[4 * i] = nearbyAt.get(i).getX();
+            positions[4 * i + 1] = nearbyAt.get(i).getY();
+            positions[4 * i + 2] = nearbyAt.get(i).getZ();
+            positions[4 * i + 3] = nearbyHidden.get(i) ? 1 : 0;
+        }
+        v.positions = positions;
+    }
+
+    private static long blockKey(int x, int y, int z) {
+        return ((long) x & 0x3FFFFFF) << 38 | ((long) z & 0x3FFFFFF) << 12 | (y & 0xFFF);
     }
 
     private static boolean exempt(Player viewer, Entity e) {
         return e.isGlowing() || e.equals(viewer.getVehicle()) || e.getPassengers().contains(viewer) || viewer.getPassengers().contains(e);
     }
 
-    private void hideKeepingTab(Player viewer, Entity e) {
-        if (e instanceof Player) keepInTab.computeIfAbsent(viewer.getUniqueId(), k -> new ConcurrentHashMap<>())
-                .put(e.getUniqueId(), System.currentTimeMillis() + TAB_KEEP_MS);
-        viewer.hideEntity(plugin, e);
+    private void hideKeepingTab(Player player, Viewer v, Entity e) {
+        if (e instanceof Player) v.keepInTab.put(e.getUniqueId(), System.currentTimeMillis() + TAB_KEEP_MS);
+        player.hideEntity(plugin, e);
     }
 
     /**
@@ -123,13 +219,14 @@ final class EntityVisibility {
      * since the last check, carried forward over the check interval plus their ping. Cuts pop-in when rounding a
      * corner. Not used when a solid block lies on the way, so pushing into a wall never lets anyone see through it.
      */
-    private Vector predictEye(Player viewer, World world, Vector eye) {
-        Vector last = lastEye.put(viewer.getUniqueId(), eye);
+    private Vector predictEye(Player player, Viewer v, World world, Vector eye) {
+        Vector last = v.lastEye;
+        v.lastEye = eye;
         if (last == null) return null;
         Vector step = eye.clone().subtract(last);
         double length = step.length();
         if (length < 0.01 || length > MAX_PREDICTED_STEP) return null;
-        double ahead = 1 + Math.min(viewer.getPing(), 500) / 50.0 / plugin.losInterval;
+        double ahead = 1 + Math.min(player.getPing(), 500) / 50.0 / plugin.losInterval;
         Vector predicted = eye.clone().add(step.multiply(ahead));
         Raycast.Solid solid = solid(world);
         boolean blocked = solid.at(predicted.getBlockX(), predicted.getBlockY(), predicted.getBlockZ())

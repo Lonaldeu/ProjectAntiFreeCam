@@ -158,6 +158,12 @@ bot.once('spawn', async () => {
   check('los: tab list still intact', !!bot.players.AfcBot2)
 
   // 6. A view change re-sends chunks to that player only, not to the player standing next to them.
+  // First let the second player's own chunk loading finish (2 s without a chunk, at most 20 s).
+  let lastChunk = Date.now()
+  const noteChunk = () => { lastChunk = Date.now() }
+  bot2._client.on('map_chunk', noteChunk)
+  for (const start = Date.now(); Date.now() - lastChunk < 2000 && Date.now() - start < 20000;) await sleep(100)
+  bot2._client.removeListener('map_chunk', noteChunk)
   let ownChunks = 0, neighbourChunks = 0
   bot._client.on('map_chunk', () => ownChunks++)
   bot2._client.on('map_chunk', () => neighbourChunks++)
@@ -166,6 +172,52 @@ bot.once('spawn', async () => {
   check('refresh: the player whose view changed got their chunks again', ownChunks > 0, `${ownChunks} chunks`)
   check('refresh: the player next to them got none', neighbourChunks === 0, `${neighbourChunks} chunks`)
   bot2.quit()
+
+  // 7. Cave occlusion (the bot is in creative, so it applies): sealed pockets arrive as stone, opening one reveals
+  // it, a pocket right next to the player is real, spectators see everything.
+  phase = 'occlusion'
+  const X0 = ((x + 160) >> 4) << 4, Z0 = (z >> 4) << 4 // a fresh area, chunk-aligned
+  const at = (dx, y, dz) => name(X0 + dx, y, Z0 + dz)
+  bot.chat(`/tp @s ${X0 + 8.5} 38 ${Z0 + 8.5}`)
+  await sleep(4000)
+  await bot.waitForChunksToLoad()
+  const pocket = (dx, dz, fx, fz) => { // a 5x5x5 air pocket at Y 20..24 with gold in its floor, sealed in stone
+    bot.chat(`/fill ${X0 + dx - 2} 20 ${Z0 + dz - 2} ${X0 + dx + 2} 24 ${Z0 + dz + 2} minecraft:air`)
+    bot.chat(`/setblock ${X0 + fx} 20 ${Z0 + fz} minecraft:gold_block`)
+  }
+  pocket(40, 8, 40, 8) // two chunks east
+  pocket(-24, 8, -24, 8) // two chunks west
+  bot.chat(`/fill ${X0 + 20} 26 ${Z0 + 6} ${X0 + 22} 28 ${Z0 + 8} minecraft:air`) // next chunk, just below the eyes
+  bot.chat(`/setblock ${X0 + 21} 26 ${Z0 + 7} minecraft:diamond_block`)
+  await sleep(1500)
+  check('occlusion: sealed pocket two chunks away arrives as stone', at(40, 20, 8) === 'stone' && at(40, 22, 8) === 'stone',
+    `${at(40, 20, 8)},${at(40, 22, 8)}`)
+  check('occlusion: the other sealed pocket too', at(-24, 20, 8) === 'stone', at(-24, 20, 8))
+  check('occlusion: a pocket right next to the player is real', at(21, 26, 7) === 'diamond_block', at(21, 26, 7))
+
+  bot.chat(`/fill ${X0 + 40} 25 ${Z0 + 8} ${X0 + 40} 37 ${Z0 + 8} minecraft:air`) // a shaft from the surface into it
+  const opened = Date.now()
+  while (Date.now() - opened < 3000 && at(40, 20, 8) !== 'gold_block') await sleep(50)
+  check('occlusion: opening a shaft into the pocket reveals it', at(40, 20, 8) === 'gold_block', `${Date.now() - opened} ms`)
+
+  bot.chat('/gamemode spectator')
+  await sleep(3000)
+  check('occlusion: spectators see sealed pockets', at(-24, 20, 8) === 'gold_block', at(-24, 20, 8))
+  bot.chat('/gamemode creative')
+  await sleep(3000)
+  check('occlusion: hidden again after leaving spectator', at(-24, 20, 8) === 'stone', at(-24, 20, 8))
+  check('occlusion: the opened pocket stays visible', at(40, 20, 8) === 'gold_block', at(40, 20, 8))
+
+  // 8. To the Nether and back to the very same spot: the world must not arrive as solid stone.
+  bot.chat('/execute in minecraft:the_nether run tp @s 0.5 100 0.5')
+  await sleep(4000)
+  bot.chat(`/execute in minecraft:overworld run tp @s ${X0 + 8.5} 38 ${Z0 + 8.5}`)
+  await sleep(5000)
+  await bot.waitForChunksToLoad()
+  check('world change: own surroundings are real after coming back', at(8, 37, 8) === 'grass_block' && at(8, 40, 8) === 'air',
+    `${at(8, 37, 8)},${at(8, 40, 8)}`)
+  check('world change: the sealed pocket is still hidden', at(-24, 20, 8) === 'stone', at(-24, 20, 8))
+  check('world change: the opened pocket is visible again', at(40, 20, 8) === 'gold_block', at(40, 20, 8))
 
   console.log(failures === 0 ? 'ALL PASSED' : `${failures} FAILED`)
   bot.quit()

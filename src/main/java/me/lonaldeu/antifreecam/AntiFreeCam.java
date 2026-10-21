@@ -4,6 +4,7 @@ import com.destroystokyo.paper.event.player.PlayerPostRespawnEvent;
 import io.netty.channel.Channel;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
+import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
@@ -18,6 +19,7 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -28,6 +30,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongConsumer;
 
 public final class AntiFreeCam extends JavaPlugin implements Listener {
 
@@ -35,14 +38,17 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
             "MINECART", "CHEST_MINECART", "HOPPER_MINECART", "TNT_MINECART", "FURNACE_MINECART", "SPAWNER_MINECART");
 
     /**
-     * What a player may not see: everything at or below {@code maxHiddenY}. {@code surface} means the player is above
-     * the protection level; otherwise the cut follows the player's own depth.
+     * What a player may not see: everything at or below {@code maxHiddenY} (below {@code minY} for nothing), plus,
+     * with {@code occlude}, the sections cave occlusion hides. {@code surface} means the player is above the
+     * protection level; otherwise the cut follows the player's own depth.
      */
-    record View(int minY, int maxHiddenY, boolean surface) {
+    record View(int minY, int maxHiddenY, boolean surface, boolean occlude) {
     }
 
-    // Players with a hidden range. Read by the packet filter on netty threads.
+    // Players with a view. Read by the packet filter on netty threads.
     final Map<UUID, View> views = new ConcurrentHashMap<>();
+    private final Map<UUID, PacketFilter> filters = new ConcurrentHashMap<>();
+    private final Map<List<Object>, List<LongConsumer>> waitingSections = new ConcurrentHashMap<>(); // world, x, z, section
     private final Map<UUID, Long> nextRefreshAt = new ConcurrentHashMap<>();
     private final Set<UUID> refreshQueued = ConcurrentHashMap.newKeySet();
     final Bedrock bedrock = new Bedrock(this);
@@ -50,7 +56,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     // Chunk packets already rewritten, per original packet and view. Another plugin's World#refreshChunk sends one
     // packet to every nearby player; most of them share a view, so it only needs rewriting once. Weak keys: entries
     // go away with the packet.
-    final Map<Object, Map<Long, Object>> rewrittenChunks = Collections.synchronizedMap(new WeakHashMap<>());
+    final Map<Object, Map<PacketFilter.ChunkView, Object>> rewrittenChunks = Collections.synchronizedMap(new WeakHashMap<>());
     Nms nms;
 
     // Settings snapshot, read from netty threads too.
@@ -63,6 +69,8 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     volatile Set<String> hiddenTypeKeys = Set.of(); // "minecraft:zombie"; always contains the player key when hiding entities
     volatile String replacementName;
     volatile int replacementId;
+    volatile boolean caveOcclusion;
+    volatile int occludedId; // what occluded sections are sent as: the replacement if it blocks sight, else stone
     volatile boolean modifyChunks, modifyBlockChanges, modifyMultiBlockChanges, stripSideChannels;
     volatile long refreshCooldownMs;
     volatile int maxChunksPerTick;
@@ -107,6 +115,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
             });
         }
         views.clear();
+        filters.clear();
         nextRefreshAt.clear();
         refreshQueued.clear();
     }
@@ -147,11 +156,12 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     private void hook(Player p) {
         Channel channel = channel(p);
         if (channel == null) return;
-        UUID id = p.getUniqueId();
+        PacketFilter filter = new PacketFilter(this, p, channel);
+        filters.put(p.getUniqueId(), filter);
         channel.eventLoop().execute(() -> {
             var pipeline = channel.pipeline();
             if (pipeline.get(PacketFilter.NAME) == null && pipeline.get("packet_handler") != null)
-                pipeline.addBefore("packet_handler", PacketFilter.NAME, new PacketFilter(this, id));
+                pipeline.addBefore("packet_handler", PacketFilter.NAME, filter);
         });
     }
 
@@ -197,9 +207,12 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         replacementName = data.getAsString();
         try {
             replacementId = nms.blockId(data);
+            // Occluded sections must look solid: anything see-through would let the client draw what's behind them.
+            occludedId = nms.isOpaque(replacementId) ? replacementId : nms.blockId(Material.STONE.createBlockData());
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(e);
         }
+        caveOcclusion = c.getBoolean("antixray.cave-occlusion", true);
 
         bedrock.load(c);
     }
@@ -212,45 +225,56 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     }
 
     /**
-     * The hidden range for a player at {@code at}, given their current one (for hysteresis), or null for none.
+     * The view for a player at {@code at}, given their current one (for hysteresis), or null for none.
      * <ul>
      * <li>At or above the protection level: everything at or below hide-below-y. The full view only comes back
      * once the player is {@code hysteresis} blocks under the protection level, so jumping on a ledge doesn't flicker.</li>
      * <li>Below it: whole 16-block sections more than underground-view-depth blocks below the player, so digging a
      * shaft to just under the protection level doesn't reveal the deep underground. Moving up only hides more once
      * the player is {@code hysteresis} blocks past a section boundary.</li>
+     * <li>With cave occlusion, a player with nothing height-hidden still gets a view, for occlusion alone.</li>
      * </ul>
      */
-    View viewAt(Location at, View current) {
+    View viewAt(Location at, View current, boolean occlude) {
         if (!protectionEnabled || !worlds.contains(at.getWorld().getName())) return null;
         int minY = at.getWorld().getMinHeight();
+        View none = caveOcclusion && nms.opaque != null ? new View(minY, minY - 1, false, occlude) : null;
         double y = at.getY();
         boolean wasSurface = current != null && current.surface();
-        if (y >= protectionY || (wasSurface && y >= protectionY - hysteresis)) return new View(minY, hideBelowY, true);
-        if (viewDepth <= 0) return null;
+        if (y >= protectionY || (wasSurface && y >= protectionY - hysteresis)) return new View(minY, hideBelowY, true, occlude);
+        if (viewDepth <= 0) return none;
 
         double reach = y - viewDepth; // the lowest Y this player gets to see, before rounding to sections
         int cut = Math.floorDiv((int) Math.floor(reach), 16) * 16 - 1;
         int held = current == null || wasSurface ? minY - 1 : current.maxHiddenY();
         if (!wasSurface && cut > held && reach < held + 1 + hysteresis) cut = held;
         cut = Math.min(cut, hideBelowY);
-        return cut < minY ? null : new View(minY, cut, false);
+        return cut < minY ? none : new View(minY, cut, false, occlude);
     }
 
     /**
-     * Updates the player's hidden range for the given location. When it changes (or {@code refresh} is set and the
+     * Updates the player's view for the given location. When it changes (or {@code refresh} is set and the
      * player has one) the client's view is re-sent so it matches.
      */
     void update(Player p, Location to, boolean refresh) {
         UUID id = p.getUniqueId();
         View before = views.get(id);
-        View after = viewAt(to, before);
+        boolean occlude = caveOcclusion && nms.opaque != null && p.getGameMode() != GameMode.SPECTATOR
+                && !p.hasPermission("antifreecam.bypass");
+        View after = viewAt(to, before, occlude);
         if (after == null) views.remove(id);
         else views.put(id, after);
+        PacketFilter filter = filters.get(id);
+        if (filter != null && after != null) {
+            World world = to.getWorld();
+            int eyeSection = Math.floorDiv((int) Math.floor(to.getY() + p.getEyeHeight()) - world.getMinHeight(), 16);
+            filter.moved(new PacketFilter.Eye(world.getUID(), to.getBlockX() >> 4, eyeSection, to.getBlockZ() >> 4));
+        }
         boolean changed = !Objects.equals(before, after);
         if (!changed && !(refresh && after != null)) return;
         if (debug && changed) getLogger().info(p.getName() + ": " + (after == null ? "full view"
-                : "hiding Y <= " + after.maxHiddenY() + (after.surface() ? " (above ground)" : " (depth limit)")));
+                : (after.maxHiddenY() < after.minY() ? "nothing height-hidden" : "hiding Y <= " + after.maxHiddenY())
+                + (after.surface() ? " (above ground)" : "") + (after.occlude() ? ", cave occlusion" : "")));
         requestRefresh(p);
     }
 
@@ -289,12 +313,74 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
                     int x = cx + dx, z = cz + dz;
                     if (!sent.isEmpty() && !sent.contains(Chunk.getChunkKey(x, z))) continue;
-                    Bukkit.getRegionScheduler().runDelayed(this, world, x, z, t -> {
-                        if (!p.isOnline() || !p.getWorld().equals(world)) return;
-                        if (!nms.sendChunk(p, world, x, z) && world.isChunkLoaded(x, z)) world.refreshChunk(x, z);
-                    }, 1 + n++ / maxChunksPerTick);
+                    sendChunk(p, world, x, z, 1 + n++ / maxChunksPerTick);
                 }
             }
+        }
+    }
+
+    /** Re-sends chunk (x, z) to this player only, after {@code delay} ticks, on the thread that owns the chunk. */
+    private void sendChunk(Player p, World world, int x, int z, long delay) {
+        Bukkit.getRegionScheduler().runDelayed(this, world, x, z, t -> {
+            if (!p.isOnline() || !p.getWorld().equals(world)) return;
+            if (Bukkit.isOwnedByCurrentRegion(p)) { // always on Paper; the client may have dropped it since it was queued
+                Set<Long> sent = p.getSentChunkKeys(); // empty where the server doesn't track it (Paper 1.21.4)
+                if (!sent.isEmpty() && !sent.contains(Chunk.getChunkKey(x, z))) return;
+            }
+            if (!nms.sendChunk(p, world, x, z) && world.isChunkLoaded(x, z)) world.refreshChunk(x, z);
+        }, delay);
+    }
+
+    /**
+     * A cave-occlusion reveal: re-sends chunk (x, z) to this player after {@code delay} ticks, unless they changed
+     * world or their client no longer holds it (a stale re-send would leave a chunk the client never unloads).
+     * Any thread.
+     */
+    void revealLater(Player p, UUID worldId, int x, int z, long delay) {
+        p.getScheduler().runDelayed(this, t -> {
+            World world = p.getWorld();
+            Set<Long> sent = p.getSentChunkKeys(); // empty where the server doesn't track it (Paper 1.21.4)
+            if (world.getUID().equals(worldId) && (sent.isEmpty() || sent.contains(Chunk.getChunkKey(x, z))))
+                sendChunk(p, world, x, z, 1);
+        }, null, delay);
+    }
+
+    /**
+     * Works out the exact connectivity of section s of chunk (x, z) on the chunk's own thread. Any thread. Players
+     * asking about the same section before it runs share one computation.
+     */
+    void sectionConnectivityLater(UUID worldId, int x, int z, int s, LongConsumer done) {
+        List<Object> key = List.of(worldId, x, z, s);
+        boolean[] first = {false};
+        waitingSections.compute(key, (k, waiting) -> {
+            if (waiting == null) {
+                first[0] = true;
+                waiting = new ArrayList<>();
+            }
+            waiting.add(done);
+            return waiting;
+        });
+        if (!first[0]) return;
+        try { // the world list may only be read on a server thread, not netty's
+            Bukkit.getGlobalRegionScheduler().execute(this, () -> {
+                World world = Bukkit.getWorld(worldId);
+                if (world == null) {
+                    waitingSections.remove(key);
+                    return;
+                }
+                Bukkit.getRegionScheduler().execute(this, world, x, z, () -> {
+                    List<LongConsumer> waiting = waitingSections.remove(key);
+                    long conn;
+                    try {
+                        conn = nms.sectionConnectivity(world, x, z, s);
+                    } catch (RuntimeException e) {
+                        conn = -1;
+                    }
+                    if (conn != -1 && waiting != null) for (LongConsumer answer : waiting) answer.accept(conn);
+                });
+            });
+        } catch (RuntimeException e) { // e.g. the plugin is being disabled
+            waitingSections.remove(key);
         }
     }
 
@@ -309,6 +395,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     public void onQuit(PlayerQuitEvent e) {
         UUID id = e.getPlayer().getUniqueId();
         views.remove(id);
+        filters.remove(id);
         nextRefreshAt.remove(id);
         refreshQueued.remove(id);
         entities.forget(id);

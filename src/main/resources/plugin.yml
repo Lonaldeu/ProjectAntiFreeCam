@@ -35,5 +35,5 @@ permissions:
   antifreecam.reload:
     default: op
   antifreecam.bypass:
-    description: See entities through walls (skips line-of-sight culling).
+    description: See entities through walls and unreachable caves (skips line-of-sight culling and cave occlusion).
     default: false

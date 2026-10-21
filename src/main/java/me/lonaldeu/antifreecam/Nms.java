@@ -1,5 +1,7 @@
 package me.lonaldeu.antifreecam;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import org.bukkit.World;
 import org.bukkit.block.data.BlockData;
@@ -33,8 +35,8 @@ final class Nms {
     final int globalBlockBits;
     private final Field chunkDataField, chunkBufferField;
     private final Field[] chunkPacketFields, chunkDataFields;
-    private final Method blockUpdatePos, blockPosY, blockPosImmutable, runUpdates, subPackets;
-    private final Method entityY, entityType, entityTypeKey, blockId;
+    private final Method blockUpdatePos, blockUpdateState, blockPosX, blockPosY, blockPosZ, blockPosImmutable, runUpdates, subPackets;
+    private final Method entityY, entityType, entityTypeKey, blockId, chunkX, chunkZ;
     private final Constructor<?> newBlockUpdate, newBundle;
     private final Unsafe unsafe;
     private Set<Integer> airIds = Set.of();
@@ -44,7 +46,11 @@ final class Nms {
     private Field chunkLightField, blockEntitiesField, blockEntityYField, lightUpdateDataField;
     private Field skyMask, blockMask, emptySkyMask, emptyBlockMask, skyArrays, blockArrays;
     private Field[] lightPacketFields, lightDataFields;
-    private final Map<Class<?>, Method> blockPosOf = new HashMap<>(), yOf = new HashMap<>();
+    private Method lightX, lightZ;
+    private final Map<Class<?>, Method> blockPosOf = new HashMap<>();
+    private final Map<Class<?>, Method[]> positionOf = new HashMap<>(); // sounds and particles: getX, getY, getZ
+    private Class<?> soundEntityPacket;
+    private Method soundEntityId;
     // Tab-list removal; null when unavailable (line-of-sight culling then briefly drops players from the tab list).
     Class<?> playerInfoRemovePacket;
     private Method profileIds;
@@ -54,6 +60,11 @@ final class Nms {
     private Field playerConnection;
     private Constructor<?> newChunkPacket;
     private final Method entityUuid;
+    // Cave occlusion; opaque is null when unavailable, and occlusion is then off.
+    boolean[] opaque; // by block state id: blocks sight (solid render, or has a block entity)
+    Class<?> forgetPacket, respawnPacket;
+    private Method forgetPos, chunkPosToLong, chunkSection, sectionStates, containerWrite, levelDimension, respawnInfo, infoDimension;
+    private Constructor<?> newFriendlyByteBuf;
 
     Nms(Logger log) throws ReflectiveOperationException {
         chunkPacket = Class.forName(GAME + "ClientboundLevelChunkWithLightPacket");
@@ -73,7 +84,12 @@ final class Nms {
         chunkDataFields = instanceFields(chunkData);
 
         blockUpdatePos = blockUpdatePacket.getMethod("getPos");
+        blockUpdateState = blockUpdatePacket.getMethod("getBlockState");
+        blockPosX = blockPos.getMethod("getX");
         blockPosY = blockPos.getMethod("getY");
+        blockPosZ = blockPos.getMethod("getZ");
+        chunkX = chunkPacket.getMethod("getX");
+        chunkZ = chunkPacket.getMethod("getZ");
         blockPosImmutable = blockPos.getMethod("immutable");
         newBlockUpdate = blockUpdatePacket.getConstructor(blockPos, blockState);
         runUpdates = sectionUpdatePacket.getMethod("runUpdates", BiConsumer.class);
@@ -100,6 +116,8 @@ final class Nms {
             chunksBiomesPacket = Class.forName(GAME + "ClientboundChunksBiomesPacket");
             lightUpdatePacket = Class.forName(GAME + "ClientboundLightUpdatePacket");
             lightUpdateDataField = accessible(lightUpdatePacket.getDeclaredField("lightData"));
+            lightX = lightUpdatePacket.getMethod("getX");
+            lightZ = lightUpdatePacket.getMethod("getZ");
             Class<?> lightData = Class.forName(GAME + "ClientboundLightUpdatePacketData");
             skyMask = accessible(lightData.getDeclaredField("skyYMask"));
             blockMask = accessible(lightData.getDeclaredField("blockYMask"));
@@ -116,15 +134,18 @@ final class Nms {
             }
             for (String name : List.of("ClientboundSoundPacket", "ClientboundLevelParticlesPacket")) {
                 Class<?> c = Class.forName(GAME + name);
-                yOf.put(c, c.getMethod("getY"));
+                positionOf.put(c, new Method[]{c.getMethod("getX"), c.getMethod("getY"), c.getMethod("getZ")});
             }
+            soundEntityPacket = Class.forName(GAME + "ClientboundSoundEntityPacket");
+            soundEntityId = soundEntityPacket.getMethod("getId");
         } catch (ReflectiveOperationException e) {
             log.warning("Light, block entity, sound and particle filtering is unavailable on this version: " + e);
             lightUpdatePacket = null;
             chunksBiomesPacket = null;
             chunkLightField = null;
             blockPosOf.clear();
-            yOf.clear();
+            positionOf.clear();
+            soundEntityPacket = null;
         }
 
         try {
@@ -151,6 +172,116 @@ final class Nms {
         } catch (ReflectiveOperationException e) {
             log.warning("Chunk refreshes will go to every nearby player on this version: " + e);
             newChunkPacket = null;
+        }
+
+        try {
+            // Which block states block sight: the same test the client's own cave culling uses, plus blocks with a
+            // block entity, so the fake chests Paper's anti-xray puts in chunk data can't link sections together.
+            Class<?> stateBase = Class.forName("net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase");
+            Method hasBlockEntity = stateBase.getMethod("hasBlockEntity");
+            Method solidRender;
+            Object[] solidArgs = {};
+            try {
+                solidRender = stateBase.getMethod("isSolidRender");
+            } catch (NoSuchMethodException before1212) {
+                solidRender = stateBase.getMethod("isSolidRender", Class.forName("net.minecraft.world.level.BlockGetter"), blockPos);
+                solidArgs = new Object[]{Class.forName("net.minecraft.world.level.EmptyBlockGetter").getField("INSTANCE").get(null),
+                        blockPos.getField("ZERO").get(null)};
+            }
+            boolean[] table = new boolean[states];
+            for (Object state : (Iterable<?>) registry) {
+                int id = (int) blockId.invoke(null, state);
+                if (id >= 0 && id < states)
+                    table[id] = (boolean) solidRender.invoke(state, solidArgs) || (boolean) hasBlockEntity.invoke(state);
+            }
+            forgetPacket = Class.forName(GAME + "ClientboundForgetLevelChunkPacket");
+            forgetPos = forgetPacket.getMethod("pos");
+            chunkPosToLong = Class.forName("net.minecraft.world.level.ChunkPos").getMethod("toLong");
+            respawnPacket = Class.forName(GAME + "ClientboundRespawnPacket");
+            respawnInfo = respawnPacket.getMethod("commonPlayerSpawnInfo");
+            infoDimension = Class.forName(GAME + "CommonPlayerSpawnInfo").getMethod("dimension");
+            levelDimension = Class.forName("net.minecraft.world.level.Level").getMethod("dimension");
+            chunkSection = Class.forName("net.minecraft.world.level.chunk.ChunkAccess").getMethod("getSection", int.class);
+            sectionStates = Class.forName("net.minecraft.world.level.chunk.LevelChunkSection").getMethod("getStates");
+            Class<?> friendlyByteBuf = Class.forName("net.minecraft.network.FriendlyByteBuf");
+            containerWrite = Class.forName("net.minecraft.world.level.chunk.PalettedContainer").getMethod("write", friendlyByteBuf);
+            newFriendlyByteBuf = friendlyByteBuf.getConstructor(ByteBuf.class);
+            if (chunkNow == null) throw new NoSuchMethodException("per-player chunk access");
+            opaque = table;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            log.warning("Cave occlusion is unavailable on this version: " + e);
+            opaque = null;
+            forgetPacket = null;
+            respawnPacket = null;
+        }
+    }
+
+    boolean isOpaque(int stateId) {
+        boolean[] table = opaque;
+        return table != null && stateId >= 0 && stateId < table.length && table[stateId];
+    }
+
+    int stateId(Object blockState) {
+        return (int) call(blockId, null, blockState);
+    }
+
+    int[] xyz(Object blockPos) {
+        return new int[]{(int) call(blockPosX, blockPos), (int) call(blockPosY, blockPos), (int) call(blockPosZ, blockPos)};
+    }
+
+    int[] blockUpdatePos(Object packet) {
+        return xyz(call(blockUpdatePos, packet));
+    }
+
+    int blockUpdateStateId(Object packet) {
+        return stateId(call(blockUpdateState, packet));
+    }
+
+    int chunkX(Object chunkPacket) {
+        return (int) call(chunkX, chunkPacket);
+    }
+
+    int chunkZ(Object chunkPacket) {
+        return (int) call(chunkZ, chunkPacket);
+    }
+
+    int lightX(Object lightPacket) {
+        return (int) call(lightX, lightPacket);
+    }
+
+    int lightZ(Object lightPacket) {
+        return (int) call(lightZ, lightPacket);
+    }
+
+    /** The column a forget-chunk packet drops, keyed like {@link Occlusion#key}. */
+    long forgottenChunk(Object packet) {
+        return (long) call(chunkPosToLong, call(forgetPos, packet));
+    }
+
+    /** Identifies a world's dimension, comparable with {@link #respawnDimension}. */
+    Object dimension(World world) {
+        return call(levelDimension, call(worldHandle, world));
+    }
+
+    Object respawnDimension(Object respawnPacket) {
+        return call(infoDimension, call(respawnInfo, respawnPacket));
+    }
+
+    /**
+     * The exact connectivity of section s of chunk (x, z), from the server's own blocks; -1 if the chunk isn't
+     * loaded. Call on the thread that owns the chunk.
+     */
+    long sectionConnectivity(World world, int x, int z, int s) {
+        Object chunk = call(chunkNow, call(chunkSource, call(worldHandle, world)), x, z);
+        if (chunk == null) return -1;
+        ByteBuf buffer = Unpooled.buffer();
+        try {
+            call(containerWrite, call(sectionStates, call(chunkSection, chunk, s)), construct(newFriendlyByteBuf, buffer));
+            byte[] bytes = new byte[buffer.readableBytes()];
+            buffer.readBytes(bytes);
+            return ChunkSections.containerConnectivity(bytes, this::isOpaque);
+        } finally {
+            buffer.release();
         }
     }
 
@@ -207,38 +338,40 @@ final class Nms {
 
     /**
      * A copy of the chunk packet with different section data. The original may be shared with other players.
-     * With {@code sideChannels}, block entities and light at or below {@code maxY} are removed too.
+     * With {@code sideChannels}, block entities and light at or below {@code maxY} or in occluded sections go too.
      */
-    Object withChunkBuffer(Object packet, byte[] buffer, boolean sideChannels, int minY, int maxY) {
+    Object withChunkBuffer(Object packet, byte[] buffer, boolean sideChannels, int minY, int maxY, long occludedMask) {
         Object data = copy(get(chunkDataField, packet), chunkDataFields);
         set(chunkBufferField, data, buffer);
         Object copy = copy(packet, chunkPacketFields);
         set(chunkDataField, copy, data);
         if (sideChannels && chunkLightField != null) {
             List<Object> kept = new ArrayList<>();
-            for (Object info : (List<?>) get(blockEntitiesField, data))
-                if ((int) get(blockEntityYField, info) > maxY) kept.add(info);
+            for (Object info : (List<?>) get(blockEntitiesField, data)) {
+                int y = (int) get(blockEntityYField, info), section = (y - minY) >> 4;
+                if (y > maxY && (section < 0 || section >= 64 || (occludedMask >> section & 1) == 0)) kept.add(info);
+            }
             set(blockEntitiesField, data, kept);
-            set(chunkLightField, copy, hideLight(get(chunkLightField, packet), minY, maxY));
+            set(chunkLightField, copy, hideLight(get(chunkLightField, packet), minY, maxY, occludedMask));
         }
         return copy;
     }
 
-    /** A copy of a light update packet with the light at or below {@code maxY} removed, or the packet itself. */
-    Object withoutLight(Object packet, int minY, int maxY) {
-        if (lightUpdatePacket == null) return packet;
+    /** A copy of a light update packet without the light at or below {@code maxY} or in occluded sections, or the packet itself. */
+    Object withoutLight(Object packet, int minY, int maxY, long occludedMask) {
+        if (lightUpdatePacket == null || maxY < minY && occludedMask == 0) return packet;
         Object copy = copy(packet, lightPacketFields);
-        set(lightUpdateDataField, copy, hideLight(get(lightUpdateDataField, packet), minY, maxY));
+        set(lightUpdateDataField, copy, hideLight(get(lightUpdateDataField, packet), minY, maxY, occludedMask));
         return copy;
     }
 
     @SuppressWarnings("unchecked")
-    private Object hideLight(Object lightData, int minY, int maxY) {
+    private Object hideLight(Object lightData, int minY, int maxY, long occludedMask) {
         Object copy = copy(lightData, lightDataFields);
         var sky = ChunkSections.hideLight(new ChunkSections.LightLayer((BitSet) get(skyMask, lightData),
-                (BitSet) get(emptySkyMask, lightData), (List<byte[]>) get(skyArrays, lightData)), minY, maxY);
+                (BitSet) get(emptySkyMask, lightData), (List<byte[]>) get(skyArrays, lightData)), minY, maxY, occludedMask);
         var blocks = ChunkSections.hideLight(new ChunkSections.LightLayer((BitSet) get(blockMask, lightData),
-                (BitSet) get(emptyBlockMask, lightData), (List<byte[]>) get(blockArrays, lightData)), minY, maxY);
+                (BitSet) get(emptyBlockMask, lightData), (List<byte[]>) get(blockArrays, lightData)), minY, maxY, occludedMask);
         set(skyMask, copy, sky.mask());
         set(emptySkyMask, copy, sky.empty());
         set(skyArrays, copy, sky.arrays());
@@ -248,20 +381,24 @@ final class Nms {
         return copy;
     }
 
-    /** The Y of a position-only packet (block entity data, block events, mining cracks, level events, sounds, particles), else null. */
-    Integer sideChannelY(Object packet) {
+    /** The block of a position-only packet (block entity data, block events, mining cracks, level events, sounds, particles), else null. */
+    int[] sideChannelPos(Object packet) {
         Method pos = blockPosOf.get(packet.getClass());
-        if (pos != null) return y(call(pos, packet));
-        Method y = yOf.get(packet.getClass());
-        return y == null ? null : (int) Math.floor((double) call(y, packet));
+        if (pos != null) return xyz(call(pos, packet));
+        double[] at = soundOrParticlePosition(packet);
+        return at == null ? null : new int[]{(int) Math.floor(at[0]), (int) Math.floor(at[1]), (int) Math.floor(at[2])};
     }
 
-    int blockUpdateY(Object packet) {
-        return y(call(blockUpdatePos, packet));
+    /** The entity a sound is attached to, or null if it isn't an entity sound. */
+    Integer soundEntityId(Object packet) {
+        return packet.getClass() == soundEntityPacket ? (Integer) call(soundEntityId, packet) : null;
     }
 
-    int y(Object blockPos) {
-        return (int) call(blockPosY, blockPos);
+    /** Where a positional sound or particle plays, or null for other packets. */
+    double[] soundOrParticlePosition(Object packet) {
+        Method[] xyz = positionOf.get(packet.getClass());
+        if (xyz == null) return null;
+        return new double[]{(double) call(xyz[0], packet), (double) call(xyz[1], packet), (double) call(xyz[2], packet)};
     }
 
     /** Calls {@code action(pos, state)} for each change in a section update packet. The pos object is reused. */

@@ -23,6 +23,11 @@ antixray:
   # Players under protection-y-level still don't get terrain more than this many blocks below
   # themselves (rounded to 16-block sections). Stops "dig a shaft to Y 30 and look down". 0 = off.
   underground-view-depth: 48
+  # Also hide 16x16x16 sections the player can't see because no see-through path leads there from
+  # them (like the client's own cave culling), such as sealed bases and caves with no opening nearby.
+  # They are sent as solid stone (or the replacement block, if that is solid). Spectators and
+  # antifreecam.bypass holders skip it. Ores next to reachable caves still need Paper's anti-xray.
+  cave-occlusion: true
 
 entities:
   # Hide listed entities (and players) that are below the hidden level.

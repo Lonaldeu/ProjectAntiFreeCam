@@ -152,8 +152,10 @@ final class Commands implements TabExecutor {
             case "block" -> send(s, "§7Replacement block: §f" + plugin.replacementName + " §7(state id " + plugin.replacementId + ")");
             case "state" -> {
                 AntiFreeCam.View view = plugin.views.get(p.getUniqueId());
-                send(s, String.format("§7Your Y: §f%.1f §7| protection Y: §f%.1f §7| hidden: §f%s", p.getY(), plugin.protectionY,
-                        view == null ? "nothing" : "Y <= " + view.maxHiddenY() + (view.surface() ? " (above ground)" : " (depth limit)")));
+                String hidden = view == null ? "nothing" : (view.maxHiddenY() < view.minY() ? "nothing below"
+                        : "Y <= " + view.maxHiddenY() + (view.surface() ? " (above ground)" : " (depth limit)"))
+                        + (view.occlude() ? ", plus unreachable caves" : "");
+                send(s, String.format("§7Your Y: §f%.1f §7| protection Y: §f%.1f §7| hidden: §f%s", p.getY(), plugin.protectionY, hidden));
             }
             case "refresh" -> {
                 if (!plugin.worlds.contains(p.getWorld().getName())) {

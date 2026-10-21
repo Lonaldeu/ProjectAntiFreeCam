@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "me.lonaldeu"
-version = "1.1.0"
+version = "1.2.0"
 
 repositories {
     mavenCentral()
@@ -34,6 +34,7 @@ tasks.jar {
 }
 
 tasks.processResources {
+    inputs.property("version", version) // so a version bump reaches plugin.yml in an existing build directory
     filesMatching("plugin.yml") { expand("version" to version) }
 }
 

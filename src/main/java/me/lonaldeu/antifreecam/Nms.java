@@ -46,6 +46,8 @@ final class Nms {
     private final Map<Class<?>, Method[]> positionOf = new HashMap<>(); // sounds and particles: getX, getY, getZ
     private Class<?> soundEntityPacket;
     private Method soundEntityId;
+    private Class<?> explodePacket;
+    private Method[] explodePosition; // getX, getY, getZ; or since 1.21.2 center, then its x, y, z
     // Tab-list removal; null when unavailable (line-of-sight culling then briefly drops players from the tab list).
     Class<?> playerInfoRemovePacket;
     private Method profileIds;
@@ -141,6 +143,20 @@ final class Nms {
             blockPosOf.clear();
             positionOf.clear();
             soundEntityPacket = null;
+        }
+
+        try {
+            Class<?> c = Class.forName(GAME + "ClientboundExplodePacket");
+            try {
+                explodePosition = new Method[]{c.getMethod("getX"), c.getMethod("getY"), c.getMethod("getZ")};
+            } catch (NoSuchMethodException since1212) {
+                Method center = c.getMethod("center");
+                Class<?> vec = center.getReturnType();
+                explodePosition = new Method[]{center, vec.getMethod("x"), vec.getMethod("y"), vec.getMethod("z")};
+            }
+            explodePacket = c;
+        } catch (ReflectiveOperationException e) {
+            log.warning("Explosions in hidden areas will be shown on this version: " + e);
         }
 
         try {
@@ -302,7 +318,12 @@ final class Nms {
     boolean sendChunk(Player p, World world, int x, int z) {
         if (newChunkPacket == null) return false;
         Object packet = chunkPacket(world, x, z);
-        if (packet == null) return true; // unloaded meanwhile: nothing to send
+        return packet == null || send(p, packet); // unloaded meanwhile: nothing to send
+    }
+
+    /** Sends a packet to this player, through their filter. False when that isn't possible on this version. Any thread. */
+    boolean send(Player p, Object packet) {
+        if (sendPacket == null) return false;
         call(sendPacket, get(playerConnection, call(playerHandle, p)), packet);
         return true;
     }
@@ -402,11 +423,14 @@ final class Nms {
                 "blockYMask", blocks.mask(), "emptyBlockYMask", blocks.empty(), "blockUpdates", blocks.arrays());
     }
 
-    /** The block of a position-only packet (block entity data, block events, mining cracks, level events, sounds, particles), else null. */
+    /**
+     * The block of a position-only packet (block entity data, block events, mining cracks, level events, sounds,
+     * particles, explosions), else null.
+     */
     int[] sideChannelPos(Object packet) {
         Method pos = blockPosOf.get(packet.getClass());
         if (pos != null) return xyz(call(pos, packet));
-        double[] at = soundOrParticlePosition(packet);
+        double[] at = packet.getClass() == explodePacket ? explosionPosition(packet) : soundOrParticlePosition(packet);
         return at == null ? null : new int[]{(int) Math.floor(at[0]), (int) Math.floor(at[1]), (int) Math.floor(at[2])};
     }
 
@@ -420,6 +444,13 @@ final class Nms {
         Method[] xyz = positionOf.get(packet.getClass());
         if (xyz == null) return null;
         return new double[]{(double) call(xyz[0], packet), (double) call(xyz[1], packet), (double) call(xyz[2], packet)};
+    }
+
+    private double[] explosionPosition(Object packet) {
+        Method[] m = explodePosition;
+        Object at = m.length == 4 ? call(m[0], packet) : packet;
+        int x = m.length - 3;
+        return new double[]{(double) call(m[x], at), (double) call(m[x + 1], at), (double) call(m[x + 2], at)};
     }
 
     /** Calls {@code action(pos, state)} for each change in a section update packet. The pos object is reused. */

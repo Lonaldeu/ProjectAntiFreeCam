@@ -53,6 +53,14 @@ bot._client.on('map_chunk', p => {
   onLight(p, p.x, p.z)
 })
 bot._client.on('update_light', p => onLight(p, p.chunkX, p.chunkZ))
+const sounds = []
+bot._client.on('sound_effect', p => sounds.push([p.x / 8, p.y / 8, p.z / 8]))
+let pocketChunk = null
+const pocketChests = {}
+bot._client.on('map_chunk', p => {
+  if (pocketChunk && p.x === pocketChunk[0] && p.z === pocketChunk[1])
+    pocketChests[phase] = (pocketChests[phase] || 0) + (p.blockEntities || []).filter(be => be.y >= 20 && be.y <= 24).length
+})
 
 bot.on('kicked', r => { console.log('KICKED', JSON.stringify(r)); process.exit(2) })
 bot.on('error', e => { console.log('ERROR', e.message); process.exit(2) })
@@ -129,36 +137,65 @@ bot.once('spawn', async () => {
   await tp(28.5)
   check('band: at Y 28.5, the room is visible again', name(x + 9, 6, z + 9) === 'glowstone', name(x + 9, 6, z + 9))
 
-  // 5. Line of sight: a second player and a pig behind a wall, seen from the surface (not as a spectator).
+  // 5. Line of sight: a second player and an armor stand behind a wall, seen from the surface (not as a spectator).
   phase = 'los'
   bot.chat('/gamemode creative')
   await tp(38)
-  const bot2 = mineflayer.createBot({ ...connection, username: 'AfcBot2' })
-  await new Promise(resolve => bot2.once('spawn', resolve))
+  const joinBot2 = async () => {
+    const b = mineflayer.createBot({ ...connection, username: 'AfcBot2' })
+    await new Promise(resolve => b.once('spawn', resolve))
+    return b
+  }
+  let bot2 = await joinBot2()
   await sleep(1000)
   const wall = material => bot.chat(`/fill ${x + 3} 38 ${z - 6} ${x + 3} 44 ${z + 6} minecraft:${material}`)
-  const pigSeen = () => Object.values(bot.entities).some(e => e.name === 'pig')
+  const standAt = [x + 6.5, 38, z + 0.5]
+  const summonStand = () => bot.chat(`/summon armor_stand ${standAt.join(' ')} {Invulnerable:1b,UUID:[I;1,2,3,4]}`)
+  const standSeen = () => Object.values(bot.entities).some(e => e.name === 'armor_stand' && e.position.y > 35)
   const playerSeen = () => !!bot.players.AfcBot2?.entity
-  const seen = () => `pig=${pigSeen()} player=${playerSeen()}`
+  const seen = () => `stand=${standSeen()} player=${playerSeen()}`
+  // Whether a sound played right at the armor stand reaches the bot.
+  const soundHeard = async () => {
+    sounds.length = 0
+    bot.chat(`/playsound minecraft:entity.armor_stand.hit neutral AfcBot ${standAt.join(' ')}`)
+    await sleep(1000)
+    return sounds.some(([sx, sy, sz]) => Math.hypot(sx - standAt[0], sy - standAt[1], sz - standAt[2]) < 2)
+  }
   wall('stone')
-  bot.chat(`/summon pig ${x + 6.5} 38 ${z + 0.5} {NoAI:1b,Invulnerable:1b}`)
+  summonStand()
   bot.chat(`/tp AfcBot2 ${x + 6.5} 38 ${z + 3.5}`)
   await sleep(2000)
-  check('los: pig and player behind a stone wall hidden', !pigSeen() && !playerSeen(), seen())
+  check('los: stand and player behind a stone wall hidden', !standSeen() && !playerSeen(), seen())
   check('los: hidden player stays in the tab list', !!bot.players.AfcBot2)
+  check('los: a sound at a hidden entity is not sent', !(await soundHeard()))
   wall('glass')
   await sleep(1500)
-  check('los: both visible through glass', pigSeen() && playerSeen(), seen())
+  check('los: both visible through glass', standSeen() && playerSeen(), seen())
   wall('stone')
   await sleep(1500)
-  check('los: hidden again behind stone', !pigSeen() && !playerSeen(), seen())
+  check('los: hidden again behind stone', !standSeen() && !playerSeen(), seen())
+  // Removed and back with the same UUID, as after a chunk reload: the server forgot its hide, the plugin must not.
+  bot.chat('/kill 00000001-0000-0002-0000-000300000004')
+  await sleep(1000)
+  summonStand()
+  await sleep(2000)
+  check('los: an entity back after the server forgot hiding it is hidden again', !standSeen(), seen())
+  bot2.quit()
+  await sleep(1500)
+  check('los: a hidden player who quits leaves the tab list', !bot.players.AfcBot2)
+  bot2 = await joinBot2() // comes back where they left: behind the wall
+  await sleep(2000)
+  check('los: a hidden player who relogs stays hidden', !playerSeen() && !!bot.players.AfcBot2, seen())
   wall('air')
   await sleep(1500)
-  check('los: both visible with the wall gone', pigSeen() && playerSeen(), seen())
+  check('los: both visible with the wall gone', standSeen() && playerSeen(), seen())
   check('los: tab list still intact', !!bot.players.AfcBot2)
+  check('los: a sound at a visible entity is sent', await soundHeard())
 
-  // 6. A view change re-sends chunks to that player only, not to the player standing next to them.
+  // 6. A view change re-sends chunks to that player only, not to the player standing next to them. As a spectator,
+  // so cave occlusion (which re-sends what it reveals) can't stand in for the refresh.
   // First let the second player's own chunk loading finish (2 s without a chunk, at most 20 s).
+  bot.chat('/gamemode spectator')
   let lastChunk = Date.now()
   const noteChunk = () => { lastChunk = Date.now() }
   bot2._client.on('map_chunk', noteChunk)
@@ -172,6 +209,14 @@ bot.once('spawn', async () => {
   check('refresh: the player whose view changed got their chunks again', ownChunks > 0, `${ownChunks} chunks`)
   check('refresh: the player next to them got none', neighbourChunks === 0, `${neighbourChunks} chunks`)
   bot2.quit()
+  // Down and straight back up: the second refresh falls inside the cooldown and must run late, not never.
+  bot.chat(`/tp @s ${x + 0.5} 20 ${z + 0.5}`)
+  await sleep(500)
+  bot.chat(`/tp @s ${x + 0.5} 38 ${z + 0.5}`)
+  await sleep(5000)
+  bad = scan(x, z, -64, 16, () => 'air')
+  check('refresh: one asked for inside the cooldown still happens', bad.length === 0, bad.join(' '))
+  bot.chat('/gamemode creative')
 
   // 7. Cave occlusion (the bot is in creative, so it applies): sealed pockets arrive as stone, opening one reveals
   // it, a pocket right next to the player is real, spectators see everything.
@@ -187,6 +232,8 @@ bot.once('spawn', async () => {
   }
   pocket(40, 8, 40, 8) // two chunks east
   pocket(-24, 8, -24, 8) // two chunks west
+  bot.chat(`/setblock ${X0 - 24} 21 ${Z0 + 8} minecraft:chest`)
+  pocketChunk = [(X0 - 24) >> 4, Z0 >> 4]
   bot.chat(`/fill ${X0 + 20} 26 ${Z0 + 6} ${X0 + 22} 28 ${Z0 + 8} minecraft:air`) // next chunk, just below the eyes
   bot.chat(`/setblock ${X0 + 21} 26 ${Z0 + 7} minecraft:diamond_block`)
   await sleep(1500)
@@ -200,9 +247,12 @@ bot.once('spawn', async () => {
   while (Date.now() - opened < 3000 && at(40, 20, 8) !== 'gold_block') await sleep(50)
   check('occlusion: opening a shaft into the pocket reveals it', at(40, 20, 8) === 'gold_block', `${Date.now() - opened} ms`)
 
+  phase = 'spectator'
   bot.chat('/gamemode spectator')
   await sleep(3000)
   check('occlusion: spectators see sealed pockets', at(-24, 20, 8) === 'gold_block', at(-24, 20, 8))
+  check('wire: spectators get the chest in the sealed pocket', pocketChests.spectator > 0, `${pocketChests.spectator} sent`)
+  phase = 'occluded'
   bot.chat('/gamemode creative')
   await sleep(3000)
   check('occlusion: hidden again after leaving spectator', at(-24, 20, 8) === 'stone', at(-24, 20, 8))
@@ -218,6 +268,8 @@ bot.once('spawn', async () => {
     `${at(8, 37, 8)},${at(8, 40, 8)}`)
   check('world change: the sealed pocket is still hidden', at(-24, 20, 8) === 'stone', at(-24, 20, 8))
   check('world change: the opened pocket is visible again', at(40, 20, 8) === 'gold_block', at(40, 20, 8))
+  check('wire: no chest sent from the sealed pocket while it is occluded', !pocketChests.occluded && !pocketChests.occlusion,
+    JSON.stringify(pocketChests))
 
   console.log(failures === 0 ? 'ALL PASSED' : `${failures} FAILED`)
   bot.quit()

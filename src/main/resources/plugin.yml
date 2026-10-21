@@ -4,7 +4,6 @@ main: me.lonaldeu.antifreecam.AntiFreeCam
 api-version: '1.20'
 description: Hides underground blocks and entities from players standing above ground.
 authors: [Lonaldeu]
-softdepend: [Geyser-Spigot, floodgate]
 folia-supported: true
 
 commands:

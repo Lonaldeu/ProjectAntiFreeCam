@@ -8,9 +8,7 @@ import org.bukkit.entity.Player;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Sits in one player's netty pipeline, ahead of the packet encoder, and rewrites or drops outgoing packets that
@@ -23,10 +21,6 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
 
     /** Where the player's eyes are: world, column (x, z), section index s. */
     record Eye(UUID world, int x, int s, int z) {
-    }
-
-    /** A chunk rewrite depends on these, so shared packets are rewritten once per combination. */
-    record ChunkView(int minY, int maxY, long occluded) {
     }
 
     private final AntiFreeCam plugin;
@@ -63,9 +57,8 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
             public void recompute(int x, int z, int s) {
                 int epoch = occlusion.epoch();
                 try {
-                    if (worldId != null) plugin.sectionConnectivityLater(worldId, x, z, s, conn -> channel.eventLoop().execute(() -> {
-                        if (occlusion.epoch() == epoch) occlusion.exact(x, z, s, conn); // else it's about the previous world
-                    }));
+                    if (worldId != null) plugin.sectionConnectivityLater(worldId, x, z, s,
+                            conn -> channel.eventLoop().execute(() -> occlusion.exact(x, z, s, conn, epoch)));
                 } catch (RuntimeException e) {
                     if (plugin.debug) plugin.getLogger().warning("Could not schedule a section check: " + e);
                 }
@@ -84,12 +77,12 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     }
 
     private boolean tracking() {
-        return plugin.caveOcclusion && plugin.modifyChunks && nms.opaque != null;
+        return plugin.caveOcclusion && nms.opaque != null;
     }
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-        AntiFreeCam.View view = plugin.views.get(id);
+        View view = plugin.views.get(id);
         Object out = msg;
         try {
             Class<?> type = msg.getClass();
@@ -137,12 +130,12 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     private Object filter(Object msg, int minY, int maxY) {
         Class<?> type = msg.getClass();
         if (type == nms.bundlePacket) return filterBundle(msg, minY, maxY);
-        if (type == nms.chunkPacket) return plugin.modifyChunks ? filterChunk(msg, minY, maxY) : msg;
+        if (type == nms.chunkPacket) return filterChunk(msg, minY, maxY);
         if (type == nms.blockUpdatePacket) {
             int[] pos = nms.blockUpdatePos(msg);
             if (tracking()) occlusion.changed(pos[0], pos[1], pos[2], nms.isOpaque(nms.blockUpdateStateId(msg)));
             // The client already shows the replacement there, so the update can simply be dropped.
-            return plugin.modifyBlockChanges && hidden(pos, maxY) ? null : msg;
+            return hidden(pos, maxY) ? null : msg;
         }
         if (type == nms.sectionUpdatePacket) return filterSectionUpdate(msg, maxY);
         if (type == nms.addEntityPacket) {
@@ -180,17 +173,6 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
             long[] conn = ChunkSections.connectivity(in, nms::isOpaque); // from the real blocks, before any rewrite
             if (conn != null) occluded = occlusion.add(nms.chunkX(packet), nms.chunkZ(packet), conn);
         }
-        ChunkView view = new ChunkView(minY, maxY, occluded);
-        Map<ChunkView, Object> done = plugin.rewrittenChunks.get(packet);
-        Object cached = done == null ? null : done.get(view);
-        if (cached != null) return cached;
-        Object filtered = rewriteChunk(packet, in, minY, maxY, occluded);
-        // An unchanged packet isn't cached: as its own value it would keep the weak key alive forever.
-        if (filtered != packet) plugin.rewrittenChunks.computeIfAbsent(packet, k -> new ConcurrentHashMap<>()).put(view, filtered);
-        return filtered;
-    }
-
-    private Object rewriteChunk(Object packet, byte[] in, int minY, int maxY, long occluded) {
         byte[] out = ChunkSections.hideBelow(in, minY, maxY, occluded, plugin.replacementId, plugin.occludedId,
                 nms::isAir, nms.globalBlockBits);
         if (out == null) {
@@ -210,7 +192,7 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
             if (track) occlusion.changed(p[0], p[1], p[2], nms.isOpaque(nms.stateId(state)));
             if (first[0] == null) first[0] = p;
         });
-        if (!plugin.modifyMultiBlockChanges || first[0] == null) return packet;
+        if (first[0] == null) return packet;
         int[] p = first[0];
         int sectionBottom = Math.floorDiv(p[1], 16) * 16;
         if (occlusion.replaced(p[0], p[1], p[2])) return null; // the client holds this whole section as replacement

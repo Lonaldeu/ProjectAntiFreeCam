@@ -17,7 +17,7 @@ elif [ -z "$jar" ]; then
   echo "Build the plugin first (see README)."
   exit 2
 fi
-[ $# -gt 0 ] || set -- paper:1.20.6 paper:1.21.4 paper:1.21.8 paper:1.21.11 folia:1.21.8
+[ $# -gt 0 ] || set -- paper:1.20.6 paper:1.21.4 paper:1.21.8 paper:1.21.11 paper:26.1.2 folia:1.21.8
 [ -d bot/node_modules ] || (cd bot && npm install --silent) || exit 2
 
 # Offline-mode UUID of the test bot, so it can be op.
@@ -51,6 +51,12 @@ for target in "$@"; do
   (cd bot && MC_VERSION=$version PORT=25566 timeout 240 node test.js) || failed=1
   docker logs afc-e2e > "$dir/server.log" 2>&1
   grep -E 'Exception|SEVERE' "$dir/server.log" | head -5
+  # The plugin logs these when something goes out unfiltered ("... on this version: " when a feature is off); no bot
+  # check might notice.
+  if [ -n "$jar" ] && grep -qE 'Self-check FAILED|Could not filter|Unrecognized chunk format|on this version: ' "$dir/server.log"; then
+    echo "FAIL $target: the plugin sent packets unfiltered (see $dir/server.log)"
+    failed=1
+  fi
   docker rm -f afc-e2e >/dev/null
 done
 exit $failed

@@ -16,17 +16,16 @@ and entities are never sent to the client, so there is nothing for a modified cl
   view, checked from where the player is about to be so they don't pop in late. Something that walks behind a pillar
   stays shown for a moment instead of flickering, and hidden players stay in the tab list.
 - **Closes side channels.** In everything it hides it also removes block light (torches, lava), biomes (deep dark marks
-  ancient cities), block entities (chests, spawners), block events, mining cracks, sounds and particles — including
-  the footsteps and other sounds of entities hidden behind walls.
+  ancient cities), block entities (chests, spawners), block events, mining cracks, explosions, sounds and particles —
+  including the footsteps and other sounds of entities hidden behind walls.
 - **Smooth transitions.** The full view comes back 2 blocks under the protection level, so jumping on a ledge doesn't
   flicker. View refreshes are rate-limited but never skipped, and only the player whose view changed gets the chunks.
 - **No dependencies.** It hooks the server's network pipeline itself; PacketEvents or ProtocolLib aren't needed.
-- **Geyser/Floodgate aware.** Bedrock players get a smaller refresh radius.
 
 ## Requirements
 
 - Paper or Folia **1.20.5 or newer**, including Minecraft 26.x. Java 21 (Java 25 for 26.x, as Minecraft itself needs).
-- Nothing else. Geyser and Floodgate are optional.
+- Nothing else.
 
 ## Installation
 
@@ -66,15 +65,27 @@ Every key in `config.yml` is commented. The ones you're most likely to change:
 | `worlds.whitelist` | `world`, `mining_world` | Worlds where protection applies (exact names) |
 | `antixray.protection-y-level` | `31.0` | At or above this Y a player counts as above ground |
 | `antixray.hide-below-y` | `16` | What above-ground players can't see |
-| `antixray.hysteresis` | `2.0` | How far under the protection level the full view returns |
+| `antixray.hysteresis` | `2.0` | How far under the protection level the full view returns; underground, how far past a section boundary the next section is hidden |
 | `antixray.underground-view-depth` | `48` | How far below themselves underground players can see; `0` turns it off |
 | `antixray.cave-occlusion` | `true` | Hide sections no see-through path leads to (sent as stone) |
-| `entities.hidden-types` | hostile, passive and display entities | Entity types that get hidden; players always are |
+| `entities.hidden-types` | hostile, passive and display entities | Entity types that get hidden; players always are, an empty list hides only them |
 | `entities.line-of-sight.enabled` | `true` | Anti-ESP culling |
 | `entities.line-of-sight.check-interval-ticks` | `2` | Raise this if the check costs too much on a busy server |
 | `performance.replacement.block-type` | `air` | What hidden blocks look like; `stone` looks less like a void |
-| `advanced.packet-processing.strip-side-channels` | `true` | Light, biome, block entity, sound and particle hiding |
-| `settings.refresh-cooldown-seconds` | `1` | Minimum time between two view refreshes for one player |
+| `advanced.packet-processing.strip-side-channels` | `true` | Light, biome, block entity, explosion, sound and particle hiding |
+| `settings.refresh-cooldown-seconds` | `1` | Minimum time between two view refreshes for one player; a refresh also waits for the last one to finish |
+| `performance.max-chunks-per-tick` | `8` | How fast a player whose view changed gets their chunks again (and cave-occlusion reveals) |
+
+Refreshes caused by a reload, `/afc world` or joining, and the extra one after a world change, are spread out
+server-wide, a quarter of a second apart, so a full server doesn't get everyone's chunks at once. A refresh needed
+because the player moved never waits for them.
+
+### Upgrading from 1.1.0
+
+An existing `config.yml` keeps its old values. To get the new defaults, set `performance.max-chunks-per-tick` to `8`
+and add `COPPER_GOLEM`, `TEXT_DISPLAY`, `ITEM_DISPLAY` and `BLOCK_DISPLAY` to `entities.hidden-types`. The
+`bedrock`, `performance.limited-area` and `advanced.packet-processing.modify-*` keys are no longer read and can be
+deleted: refreshes always cover the whole view distance, and every packet type is always filtered.
 
 ## Commands and permissions
 
@@ -83,8 +94,8 @@ Every key in `config.yml` is commented. The ones you're most likely to change:
 | `/afc` | `/antifreecam`, `/freecam` | see below | Main command; lists its subcommands |
 | `/afc reload` | `/afcreload` | `antifreecam.reload` | Reloads the config and re-checks every player |
 | `/afc world <list\|add\|remove> [world]` | `/afcworld` | `antifreecam.world` | Manages the world whitelist |
-| `/afc debug` | `/afcdebug` | `antifreecam.debug` | Toggles debug logging |
-| `/afc stats` | | `antifreecam.admin` | Platform, players with a filtered view, Bedrock detection |
+| `/afc debug` | `/afcdebug` | `antifreecam.debug` | Toggles debug logging until the next reload |
+| `/afc stats` | | `antifreecam.admin` | Platform, players with a filtered view |
 | `/afc test <block\|state\|refresh>` | | `antifreecam.admin` | Shows the replacement block or your view, or re-sends your chunks |
 
 | Permission | Default | |
@@ -118,6 +129,13 @@ Not tested yet: ViaVersion, real Bedrock clients, and large player counts.
 - Breaking into a hidden pocket far from the player (someone else mining, an explosion) shows stone for a few ticks
   before the pocket appears. Next to the player it is instant.
 - An entity behind a wall can take up to about two ticks plus the player's ping to appear when they step into view.
+- An entity the player already got that goes below the hidden level more than `max-distance` (64) blocks away
+  sideways is still sent until it comes closer. Entities that are already down there when the player comes near
+  are never sent.
+- Dropped items, experience orbs and boats aren't in the default `hidden-types`: listing them costs a
+  line-of-sight check each.
+- Entities another plugin makes invisible by default (per-player holograms and markers) are left to that plugin: it
+  decides who sees them.
 - On Folia, if nearby entities belong to a different region than the player, that entity check is skipped and
   retried on the next one.
 
@@ -140,7 +158,9 @@ docker run --rm -v "$PWD:/work" -w /work gradle:9.2.1-jdk21 gradle build
 `e2e/run.sh` starts real Paper and Folia servers in Docker with the built plugin, connects bot clients and checks what
 they actually receive: hidden terrain, light, biomes and block entities on the wire, entities crossing the hidden
 level, line of sight through stone and glass, the tab list, that refreshes reach only the player who needs them, cave
-occlusion (sealed pockets arrive as stone, opening one reveals it, spectators see everything) and world changes.
+occlusion (sealed pockets arrive as stone, opening one reveals it, spectators see everything), sounds at hidden
+entities, hidden players who quit or relog, and world changes. A run also fails when the server log shows the
+plugin sending anything unfiltered.
 It needs Docker, Node.js and curl.
 
 ```bash
@@ -148,8 +168,6 @@ e2e/run.sh                                 # every tested server build
 e2e/run.sh paper:1.21.8 folia:1.21.8       # just these
 e2e/run.sh --without-plugin paper:1.21.8   # control run: the hiding checks should fail
 ```
-
-On Paper 1.20.6 the bot library can't see pigs, so the two pig checks fail there with or without the plugin.
 
 ## License and provenance
 

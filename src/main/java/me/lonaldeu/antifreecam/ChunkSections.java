@@ -83,7 +83,7 @@ final class ChunkSections {
             // The one section that straddles the cut: its lower rows become the replacement.
             int[] blocks = new int[BLOCKS];
             if (masked) Arrays.fill(blocks, occluded);
-            else blocks = readContainer(ByteBuffer.wrap(in, s[1], s[2] - s[1]), BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
+            else readContainer(ByteBuffer.wrap(in, s[1], s[2] - s[1]), BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed, blocks);
             Arrays.fill(blocks, 0, (maxY - baseY + 1) * 256, replacement);
             int nonAir = 0;
             for (int id : blocks) if (!isAir.test(id)) nonAir++;
@@ -129,6 +129,7 @@ final class ChunkSections {
     private static final ThreadLocal<boolean[]> OPEN = ThreadLocal.withInitial(() -> new boolean[BLOCKS]);
     private static final ThreadLocal<boolean[]> SEEN = ThreadLocal.withInitial(() -> new boolean[BLOCKS]);
     private static final ThreadLocal<int[]> STACK = ThreadLocal.withInitial(() -> new int[BLOCKS]);
+    private static final ThreadLocal<int[]> IDS = ThreadLocal.withInitial(() -> new int[BLOCKS]);
 
     /**
      * Each section's face connectivity (see {@link Occlusion}) from the chunk packet's section data, or null when it
@@ -199,7 +200,7 @@ final class ChunkSections {
             }
         }
         r.reset();
-        int[] ids = readContainer(r, BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
+        int[] ids = readContainer(r, BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed, IDS.get());
         boolean[] open = OPEN.get();
         int opaqueCells = 0;
         for (int i = 0; i < BLOCKS; i++) {
@@ -280,10 +281,14 @@ final class ChunkSections {
     }
 
     static int[] readContainer(ByteBuffer r, int entries, int maxIndirectBits, boolean prefixed) {
+        return readContainer(r, entries, maxIndirectBits, prefixed, new int[entries]);
+    }
+
+    /** Reads a container into {@code values}, which has room for {@code entries}, and returns it. */
+    static int[] readContainer(ByteBuffer r, int entries, int maxIndirectBits, boolean prefixed, int[] values) {
         int bits = r.get() & 0xFF;
-        int[] values = new int[entries];
         if (bits == 0) {
-            Arrays.fill(values, readVarInt(r));
+            Arrays.fill(values, 0, entries, readVarInt(r));
             if (prefixed) expect(readVarInt(r), 0);
             return values;
         }
@@ -325,7 +330,13 @@ final class ChunkSections {
     /** Writes a block container. A single value stands for a section filled with that block. */
     static void writeBlocks(ByteArrayOutputStream out, int[] values, int globalBits, boolean prefixed) {
         Map<Integer, Integer> palette = new LinkedHashMap<>();
-        for (int v : values) palette.putIfAbsent(v, palette.size());
+        int last = values[0];
+        palette.put(last, 0);
+        for (int v : values) { // runs of one block are common: only look up where the value changes
+            if (v == last) continue;
+            last = v;
+            palette.putIfAbsent(v, palette.size());
+        }
         if (palette.size() == 1) {
             out.write(0);
             writeVarInt(out, values[0]);
@@ -343,14 +354,20 @@ final class ChunkSections {
         int perLong = 64 / bits;
         int longs = (values.length + perLong - 1) / perLong;
         if (prefixed) writeVarInt(out, longs);
+        ByteBuffer words = ByteBuffer.allocate(longs * 8);
+        int value = values[0], index = direct ? value : palette.get(value);
         for (int i = 0, k = 0; i < longs; i++) {
             long word = 0;
             for (int j = 0; j < perLong && k < values.length; j++, k++) {
-                long v = direct ? values[k] : palette.get(values[k]);
-                word |= v << (j * bits);
+                if (values[k] != value) {
+                    value = values[k];
+                    index = direct ? value : palette.get(value);
+                }
+                word |= (long) index << (j * bits);
             }
-            for (int shift = 56; shift >= 0; shift -= 8) out.write((int) (word >>> shift));
+            words.putLong(word);
         }
+        out.write(words.array(), 0, words.position());
     }
 
     private static void expect(int actual, int expected) {

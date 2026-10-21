@@ -7,8 +7,11 @@ import org.bukkit.Chunk;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
+import org.bukkit.Registry;
 import org.bukkit.World;
 import org.bukkit.block.data.BlockData;
+import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -20,7 +23,6 @@ import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -28,35 +30,26 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
-import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongConsumer;
 
 public final class AntiFreeCam extends JavaPlugin implements Listener {
 
-    private static final List<String> FALLBACK_TYPES = List.of("ARMOR_STAND", "ITEM_FRAME", "GLOW_ITEM_FRAME", "PAINTING",
-            "MINECART", "CHEST_MINECART", "HOPPER_MINECART", "TNT_MINECART", "FURNACE_MINECART", "SPAWNER_MINECART");
-
-    /**
-     * What a player may not see: everything at or below {@code maxHiddenY} (below {@code minY} for nothing), plus,
-     * with {@code occlude}, the sections cave occlusion hides. {@code surface} means the player is above the
-     * protection level; otherwise the cut follows the player's own depth.
-     */
-    record View(int minY, int maxHiddenY, boolean surface, boolean occlude) {
-    }
+    // Refreshes not caused by the player's own movement (new settings or whitelist, joining, a forced refresh) start
+    // at least this far apart server-wide, so a reload on a full server doesn't re-send everyone's chunks at once.
+    private static final long REFRESH_SPACING_MS = 250;
 
     // Players with a view. Read by the packet filter on netty threads.
     final Map<UUID, View> views = new ConcurrentHashMap<>();
     private final Map<UUID, PacketFilter> filters = new ConcurrentHashMap<>();
     private final Map<List<Object>, List<LongConsumer>> waitingSections = new ConcurrentHashMap<>(); // world, x, z, section
-    private final Map<UUID, Long> nextRefreshAt = new ConcurrentHashMap<>();
-    private final Set<UUID> refreshQueued = ConcurrentHashMap.newKeySet();
-    final Bedrock bedrock = new Bedrock(this);
+    private final Map<UUID, Long> nextRefreshAt = new ConcurrentHashMap<>(); // monotonic millis, see now()
+    private final Set<UUID> refreshQueued = ConcurrentHashMap.newKeySet(), spacedRefreshQueued = ConcurrentHashMap.newKeySet();
+    private final AtomicLong refreshSlot = new AtomicLong(Long.MIN_VALUE / 2); // when the next spaced refresh may start
+    private final Map<UUID, Integer> viewGenerations = new ConcurrentHashMap<>(); // settingsGeneration of each player's view
+    volatile int settingsGeneration; // bumped whenever the settings or the whitelist change
     final EntityVisibility entities = new EntityVisibility(this);
-    // Chunk packets already rewritten, per original packet and view. Another plugin's World#refreshChunk sends one
-    // packet to every nearby player; most of them share a view, so it only needs rewriting once. Weak keys: entries
-    // go away with the packet.
-    final Map<Object, Map<PacketFilter.ChunkView, Object>> rewrittenChunks = Collections.synchronizedMap(new WeakHashMap<>());
     Nms nms;
 
     // Settings snapshot, read from netty threads too.
@@ -71,15 +64,13 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     volatile int replacementId;
     volatile boolean caveOcclusion;
     volatile int occludedId; // what occluded sections are sent as: the replacement if it blocks sight, else stone
-    volatile boolean modifyChunks, modifyBlockChanges, modifyMultiBlockChanges, stripSideChannels;
+    volatile boolean stripSideChannels;
     volatile long refreshCooldownMs;
     volatile int maxChunksPerTick;
-    volatile boolean limitedArea;
-    volatile int limitedRadius;
     volatile boolean lineOfSight;
     volatile long losInterval;
     volatile double losMaxDistance, losAlwaysVisible;
-    volatile Set<String> trackedTypeKeys = Set.of(); // the listed types plus players, for the visibility pass
+    volatile Set<EntityType> trackedTypes = Set.of(); // the listed types plus players, for the visibility pass
 
     @Override
     public void onEnable() {
@@ -139,10 +130,13 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
                 if (channel.pipeline().get(PacketFilter.NAME) != null) channel.pipeline().remove(PacketFilter.NAME);
             });
         }
+        entities.showAll(); // queued behind the filter removal, so the re-sent spawns go out as they are
         views.clear();
         filters.clear();
         nextRefreshAt.clear();
         refreshQueued.clear();
+        spacedRefreshQueued.clear();
+        viewGenerations.clear();
     }
 
     /** E.g. "Folia 1.21.8". All scheduling goes through Paper's region/entity schedulers, which work on both. */
@@ -201,21 +195,21 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         hysteresis = Math.max(0, c.getDouble("antixray.hysteresis", 2.0));
         viewDepth = c.getInt("antixray.underground-view-depth", 48);
         protectionEnabled = c.getBoolean("performance.underground-protection.enabled", true);
-        maxChunksPerTick = Math.max(1, c.getInt("performance.max-chunks-per-tick", 50));
-        limitedArea = c.getBoolean("performance.limited-area.enabled", false);
-        limitedRadius = c.getInt("performance.limited-area.chunk-radius", 3);
-        modifyChunks = c.getBoolean("advanced.packet-processing.modify-chunk-data", true);
-        modifyBlockChanges = c.getBoolean("advanced.packet-processing.modify-block-changes", true);
-        modifyMultiBlockChanges = c.getBoolean("advanced.packet-processing.modify-multi-block-changes", true);
+        maxChunksPerTick = Math.max(1, c.getInt("performance.max-chunks-per-tick", 8));
         stripSideChannels = c.getBoolean("advanced.packet-processing.strip-side-channels", true);
 
         hideEntities = c.getBoolean("entities.hide-entities", true);
-        List<String> types = c.getStringList("entities.hidden-types");
         Set<String> keys = new HashSet<>();
-        for (String t : types.isEmpty() ? FALLBACK_TYPES : types) keys.add("minecraft:" + t.toLowerCase(Locale.ROOT));
+        for (String t : c.getStringList("entities.hidden-types")) keys.add("minecraft:" + t.toLowerCase(Locale.ROOT));
         keys.add("minecraft:player");
         hiddenTypeKeys = hideEntities ? Set.copyOf(keys) : Set.of();
-        trackedTypeKeys = Set.copyOf(keys);
+        Set<EntityType> tracked = new HashSet<>();
+        for (String key : keys) { // types this server version doesn't have are skipped
+            NamespacedKey k = NamespacedKey.fromString(key);
+            EntityType type = k == null ? null : Registry.ENTITY_TYPE.get(k);
+            if (type != null) tracked.add(type);
+        }
+        trackedTypes = Set.copyOf(tracked);
         lineOfSight = c.getBoolean("entities.line-of-sight.enabled", true);
         losInterval = Math.max(1, c.getInt("entities.line-of-sight.check-interval-ticks", 2));
         losMaxDistance = c.getDouble("entities.line-of-sight.max-distance", 64);
@@ -238,8 +232,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
             throw new IllegalStateException(e);
         }
         caveOcclusion = c.getBoolean("antixray.cave-occlusion", true);
-
-        bedrock.load(c);
+        settingsGeneration++;
     }
 
     /** Re-check every online player, e.g. after the settings or the whitelist changed. */
@@ -270,10 +263,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         if (viewDepth <= 0) return none;
 
         double reach = y - viewDepth; // the lowest Y this player gets to see, before rounding to sections
-        int cut = Math.floorDiv((int) Math.floor(reach), 16) * 16 - 1;
-        int held = current == null || wasSurface ? minY - 1 : current.maxHiddenY();
-        if (!wasSurface && cut > held && reach < held + 1 + hysteresis) cut = held;
-        cut = Math.min(cut, hideBelowY);
+        int cut = Math.min(View.depthCut(reach, current == null ? minY - 1 : current.maxHiddenY(), hysteresis), hideBelowY);
         return cut < minY ? none : new View(minY, cut, false, occlude);
     }
 
@@ -295,38 +285,49 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
             int eyeSection = Math.floorDiv((int) Math.floor(to.getY() + p.getEyeHeight()) - world.getMinHeight(), 16);
             filter.moved(new PacketFilter.Eye(world.getUID(), to.getBlockX() >> 4, eyeSection, to.getBlockZ() >> 4));
         }
+        Integer generation = viewGenerations.put(id, settingsGeneration);
         boolean changed = !Objects.equals(before, after);
         if (!changed && !(refresh && after != null)) return;
         if (debug && changed) getLogger().info(p.getName() + ": " + (after == null ? "full view"
                 : (after.maxHiddenY() < after.minY() ? "nothing height-hidden" : "hiding Y <= " + after.maxHiddenY())
                 + (after.surface() ? " (above ground)" : "") + (after.occlude() ? ", cave occlusion" : "")));
-        requestRefresh(p);
+        // Only a view the player's own movement changed is urgent; one from new settings or a first view is spaced.
+        requestRefresh(p, !changed || generation == null || generation != settingsGeneration);
     }
 
     /**
-     * Re-sends the player's view, at most once per refresh cooldown. A request inside the cooldown is never dropped:
-     * it runs when the cooldown ends, using whatever the player's state is by then.
+     * Re-sends the player's view, at most once per refresh cooldown and never while their last refresh is still
+     * being sent. A request inside the cooldown is never dropped: it runs when the cooldown ends, using whatever the
+     * player's state is by then. {@code spaced} requests also wait for a server-wide slot; urgent ones never wait
+     * for those.
      */
-    void requestRefresh(Player p) {
+    void requestRefresh(Player p, boolean spaced) {
         UUID id = p.getUniqueId();
-        if (!refreshQueued.add(id)) return; // one is already on its way
-        long wait = Math.max(0, nextRefreshAt.getOrDefault(id, 0L) - System.currentTimeMillis());
+        Set<UUID> queued = spaced ? spacedRefreshQueued : refreshQueued;
+        if (spaced && refreshQueued.contains(id) || !queued.add(id)) return; // one is already on its way
+        long now = now();
+        long start = nextRefreshAt.getOrDefault(id, now);
+        if (spaced) start = Math.max(start, refreshSlot.accumulateAndGet(now, (last, t) -> Math.max(last + REFRESH_SPACING_MS, t)));
         p.getScheduler().runDelayed(this, t -> {
-            refreshQueued.remove(id);
-            nextRefreshAt.put(id, System.currentTimeMillis() + refreshCooldownMs);
-            refreshView(p); // entities follow on their own: the visibility pass re-checks them every few ticks
-        }, () -> refreshQueued.remove(id), 2 + (wait + 49) / 50);
+            queued.remove(id);
+            int chunks = refreshView(p); // entities follow on their own: the visibility pass re-checks them every few ticks
+            nextRefreshAt.put(id, now() + Math.max(refreshCooldownMs, chunks * 50L / maxChunksPerTick));
+        }, () -> queued.remove(id), 2 + (Math.max(0, start - now) + 49) / 50);
+    }
+
+    /** Milliseconds on a clock that never steps back, so a system clock correction can't stall refreshes. */
+    private static long now() {
+        return System.nanoTime() / 1_000_000;
     }
 
     /**
-     * Re-sends the chunks the player's client holds, nearest first, spread over ticks. Each chunk goes to this
-     * player only; World#refreshChunk would re-send it to everyone nearby.
+     * Re-sends the chunks the player's client holds, nearest first, spread over ticks; returns how many. Each chunk
+     * goes to this player only; World#refreshChunk would re-send it to everyone nearby. Always the whole view
+     * distance: a chunk left out would keep whatever an earlier, less strict view let through.
      */
-    void refreshView(Player p) {
+    int refreshView(Player p) {
         World world = p.getWorld();
         int r = world.getViewDistance();
-        if (limitedArea) r = Math.min(r, limitedRadius);
-        r = bedrock.adjustRadius(p, r);
         int cx = p.getLocation().getBlockX() >> 4, cz = p.getLocation().getBlockZ() >> 4;
         // Empty where the server doesn't track it (Paper 1.21.4): then send everything in range; clients ignore
         // chunks they don't hold.
@@ -342,6 +343,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
                 }
             }
         }
+        return n;
     }
 
     /** Re-sends chunk (x, z) to this player only, after {@code delay} ticks, on the thread that owns the chunk. */
@@ -371,8 +373,9 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     }
 
     /**
-     * Works out the exact connectivity of section s of chunk (x, z) on the chunk's own thread. Any thread. Players
-     * asking about the same section before it runs share one computation.
+     * Works out the exact connectivity of section s of chunk (x, z) on the chunk's own thread, a few ticks later. Any
+     * thread. Players asking about the same section before it runs share one computation, so a redstone clock or a
+     * farm changing blocks every tick costs one computation every few ticks, not one per change.
      */
     void sectionConnectivityLater(UUID worldId, int x, int z, int s, LongConsumer done) {
         List<Object> key = List.of(worldId, x, z, s);
@@ -393,7 +396,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
                     waitingSections.remove(key);
                     return;
                 }
-                Bukkit.getRegionScheduler().execute(this, world, x, z, () -> {
+                Bukkit.getRegionScheduler().runDelayed(this, world, x, z, t -> {
                     List<LongConsumer> waiting = waitingSections.remove(key);
                     long conn;
                     try {
@@ -402,7 +405,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
                         conn = -1;
                     }
                     if (conn != -1 && waiting != null) for (LongConsumer answer : waiting) answer.accept(conn);
-                });
+                }, 4);
             });
         } catch (RuntimeException e) { // e.g. the plugin is being disabled
             waitingSections.remove(key);
@@ -411,7 +414,6 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
-        bedrock.logJoin(e.getPlayer());
         track(e.getPlayer());
         update(e.getPlayer(), e.getPlayer().getLocation(), false);
     }
@@ -423,7 +425,9 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         filters.remove(id);
         nextRefreshAt.remove(id);
         refreshQueued.remove(id);
-        entities.forget(id);
+        spacedRefreshQueued.remove(id);
+        viewGenerations.remove(id);
+        entities.quit(id);
     }
 
     // Paper fires this before the destination chunks are sent, so the state is right from the first chunk.

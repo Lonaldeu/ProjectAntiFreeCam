@@ -143,8 +143,12 @@ final class Occlusion {
         else c.dirty |= 1L << s; // worked out once reached, or once occlusion applies to this player again
     }
 
-    /** The exact connectivity of section s of column (x, z), worked out by the server after a change. */
-    void exact(int x, int z, int s, long conn) {
+    /**
+     * The exact connectivity of section s of column (x, z), worked out by the server after a change, asked for under
+     * {@code epoch}. An answer from before the last {@link #clear()} is about the previous world's chunks: ignored.
+     */
+    void exact(int x, int z, int s, long conn, int epoch) {
+        if (epoch != this.epoch) return;
         Col c = cols.get(key(x, z));
         if (c == null || s >= Math.min(c.conn.length, 64)) return;
         c.pending &= ~(1L << s);
@@ -207,7 +211,7 @@ final class Occlusion {
         epoch++;
     }
 
-    /** Changes on every {@link #clear()}: an {@link #exact} answer requested under another epoch is about other chunks. */
+    /** Changes on every {@link #clear()}; pass it back with the {@link #exact} answer. */
     int epoch() {
         return epoch;
     }

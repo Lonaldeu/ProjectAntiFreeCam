@@ -26,7 +26,7 @@ class OcclusionTest {
         final Map<Long, long[]> columns = new HashMap<>();
         final Map<Long, Long> clientHidden = new HashMap<>(); // what the client holds as replacement
         final List<int[]> resends = new ArrayList<>(); // {x, z}
-        final List<int[]> recomputes = new ArrayList<>(); // {x, z, s}
+        final List<int[]> recomputes = new ArrayList<>(); // {x, z, s, epoch}
         final ArrayDeque<int[]> pendingResends = new ArrayDeque<>(), pendingRecomputes = new ArrayDeque<>();
         final Occlusion occlusion = new Occlusion(new Occlusion.Server() {
             @Override
@@ -37,8 +37,9 @@ class OcclusionTest {
 
             @Override
             public void recompute(int x, int z, int s) {
-                recomputes.add(new int[]{x, z, s});
-                pendingRecomputes.add(new int[]{x, z, s});
+                int[] r = {x, z, s, occlusion.epoch()};
+                recomputes.add(r);
+                pendingRecomputes.add(r);
             }
         });
 
@@ -59,7 +60,7 @@ class OcclusionTest {
             while (!pendingResends.isEmpty() || !pendingRecomputes.isEmpty()) {
                 if (!pendingRecomputes.isEmpty()) {
                     int[] r = pendingRecomputes.poll();
-                    occlusion.exact(r[0], r[1], r[2], columns.get(Occlusion.key(r[0], r[1]))[r[2]]);
+                    occlusion.exact(r[0], r[1], r[2], columns.get(Occlusion.key(r[0], r[1]))[r[2]], r[3]);
                 } else {
                     int[] c = pendingResends.poll();
                     send(c[0], c[1]);
@@ -248,14 +249,36 @@ class OcclusionTest {
         assertTrue(w.resends.isEmpty());
     }
 
+    /** A cave under the cut must not count as a way into what lies above it. */
     @Test
     void sectionsUnderTheHeightCutAreNotOccludedOrEntered() {
-        World w = flat(1);
+        World w = new World();
         w.occlusion.view(0, 15, true); // section 0 is height-hidden
-        w.occlusion.moveTo(0, 2, 0);
-        w.column(0, 0, SKY, SKY, SKY);
+        w.column(0, 0, SKY, SKY, STONE);
+        w.column(1, 0, SKY, STONE, STONE);
+        w.column(2, 0, SKY, STONE, STONE);
+        w.column(3, 0, SKY, Occlusion.pairs(D), STONE); // a pocket only reachable from below
+        w.occlusion.moveTo(0, 1, 0);
         w.sendAll();
         w.settle();
-        assertEquals(0, w.hidden(0, 0) & 1);
+        assertEquals(0, w.hidden(0, 0) & 1); // under the cut: not occlusion's business
+        assertEquals(0b010, w.hidden(3, 0) & 0b010);
+    }
+
+    /** A new world while a section is being worked out: the answer is about the old world and must open nothing. */
+    @Test
+    void answerFromBeforeAWorldChangeIsIgnored() {
+        World w = flat(2);
+        w.occlusion.moveTo(0, 2, 0);
+        w.sendAll();
+        w.settle();
+        w.occlusion.changed(2 * 16 + 5, 16, 5, false);
+        int[] stale = w.pendingRecomputes.poll();
+        w.occlusion.clear(); // the new world is just as sealed
+        w.sendAll();
+        w.settle();
+        w.resends.clear();
+        w.occlusion.exact(stale[0], stale[1], stale[2], OPEN_SURFACE, stale[3]); // "a hole leads down", about the old world
+        assertTrue(w.resends.isEmpty());
     }
 }

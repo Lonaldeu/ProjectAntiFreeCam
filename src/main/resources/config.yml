@@ -1,8 +1,8 @@
 settings:
   # Log state changes to the console.
   debug-mode: false
-  # Minimum seconds between two view refreshes for one player. A refresh asked for sooner is
-  # delayed until the cooldown ends, never skipped.
+  # Minimum seconds between two view refreshes for one player, and a refresh never starts before
+  # the last one has finished sending. A refresh asked for sooner is delayed, never skipped.
   refresh-cooldown-seconds: 1
 
 worlds:
@@ -18,7 +18,8 @@ antixray:
   # Blocks and entities at or below this Y are hidden from above-ground players.
   hide-below-y: 16
   # Above-ground players get the full view back only this many blocks under protection-y-level,
-  # so jumping around on a ledge doesn't make the view flicker.
+  # so jumping around on a ledge doesn't make the view flicker. Underground, the next section
+  # down is likewise only hidden once the player is this many blocks above its boundary.
   hysteresis: 2.0
   # Players under protection-y-level still don't get terrain more than this many blocks below
   # themselves (rounded to 16-block sections). Stops "dig a shaft to Y 30 and look down". 0 = off.
@@ -43,7 +44,8 @@ entities:
     always-visible-distance: 3
     # Entities farther than this aren't checked.
     max-distance: 64
-  # Entity types hidden while underground. Players are always hidden.
+  # Entity types that get hidden (types this server version doesn't have are skipped). Players
+  # always are. An empty list hides players only.
   hidden-types:
     - ARMOR_STAND
     - ITEM_FRAME
@@ -124,43 +126,24 @@ entities:
     - BEE
     - BAT
     - STRIDER
+    - COPPER_GOLEM
+    - TEXT_DISPLAY
+    - ITEM_DISPLAY
+    - BLOCK_DISPLAY
 
 performance:
   # Master switch for hiding.
   underground-protection:
     enabled: true
-  # Chunks re-sent per tick during a view refresh.
-  max-chunks-per-tick: 50
-  # Cap the refresh radius (in chunks) below the server view distance.
-  limited-area:
-    enabled: false
-    chunk-radius: 3
+  # Chunks re-sent per tick and player during a view refresh or a cave-occlusion reveal (Paper
+  # itself sends about 4).
+  max-chunks-per-tick: 8
   replacement:
     # What hidden blocks look like, e.g. air, stone, deepslate.
     block-type: "air"
 
 advanced:
   packet-processing:
-    modify-chunk-data: true
-    modify-block-changes: true
-    modify-multi-block-changes: true
     # Also hide what gives away hidden areas: light (torches, lava), biomes (deep dark),
-    # block entities (chests, spawners), block events, mining cracks, sounds and particles.
+    # block entities (chests, spawners), block events, mining cracks, explosions, sounds and particles.
     strip-side-channels: true
-
-bedrock:
-  enabled: true
-  detection:
-    use-geyser-api: true
-    use-floodgate-api: true
-    use-uuid-pattern: true
-    use-name-prefix: true
-    name-prefixes:
-      - "."
-  optimizations:
-    # Bedrock players get a smaller refresh radius.
-    chunk-radius-reduction: 1
-    minimum-chunk-radius: 2
-  logging:
-    log-detection: true
-    log-detection-method: false

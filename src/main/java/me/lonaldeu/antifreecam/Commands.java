@@ -64,10 +64,8 @@ final class Commands implements TabExecutor {
 
     private void debug(CommandSender s) {
         if (denied(s, "antifreecam.debug")) return;
-        plugin.debug = !plugin.debug;
-        plugin.getConfig().set("settings.debug-mode", plugin.debug);
-        plugin.saveConfig();
-        send(s, "§aDebug logging " + (plugin.debug ? "§aon" : "§7off") + "§a.");
+        plugin.debug = !plugin.debug; // not saved: saving would also write back config edits not reloaded yet
+        send(s, "§aDebug logging " + (plugin.debug ? "§aon" : "§7off") + "§a until the next reload.");
     }
 
     private void reload(CommandSender s) {
@@ -76,7 +74,6 @@ final class Commands implements TabExecutor {
         plugin.reevaluateAll(true);
         send(s, "§aSettings reloaded.");
         send(s, "§7Protected worlds: §b" + new TreeSet<>(plugin.worlds));
-        send(s, "§7Bedrock players online: §d" + plugin.bedrock.onlineCount());
     }
 
     private void world(CommandSender s, String[] args) {
@@ -95,51 +92,46 @@ final class Commands implements TabExecutor {
             return;
         }
         String name = args[1];
-        var updated = new TreeSet<>(plugin.worlds);
+        plugin.reloadConfig(); // change the file as it is now, so edits not reloaded yet aren't overwritten
+        var config = plugin.getConfig();
+        if (config.getKeys(false).isEmpty()) {
+            send(s, "§cconfig.yml couldn't be read; fix it first.");
+            return;
+        }
+        var updated = new TreeSet<>(config.getStringList("worlds.whitelist"));
         if (action.equals("add")) {
             if (Bukkit.getWorld(name) == null) {
                 send(s, "§cWorld not found: " + name);
                 return;
             }
-            if (!updated.add(name)) {
+            // Nothing to do only when the file and the whitelist in effect agree.
+            if (!updated.add(name) && plugin.worlds.contains(name)) {
                 send(s, "§6" + name + " is already protected.");
                 return;
             }
-        } else if (!updated.remove(name)) {
+        } else if (!updated.remove(name) && !plugin.worlds.contains(name)) {
             send(s, "§6" + name + " is not protected.");
             return;
         }
-        plugin.getConfig().set("worlds.whitelist", new ArrayList<>(updated));
+        config.set("worlds.whitelist", new ArrayList<>(updated));
         plugin.saveConfig();
         plugin.worlds = java.util.Set.copyOf(updated);
-        plugin.reevaluateAll(true);
+        plugin.settingsGeneration++;
+        plugin.reevaluateAll(false); // only players whose view changed need their chunks again
         send(s, "§a" + (action.equals("add") ? "Now protecting " : "No longer protecting ") + name + ".");
+        send(s, "§7Protected worlds: §b" + updated);
     }
 
     private void stats(CommandSender s) {
         if (denied(s, "antifreecam.admin")) return;
-        Bedrock b = plugin.bedrock;
         send(s, "§3§lStatus");
         s.sendMessage("§eVersion: §a" + plugin.getPluginMeta().getVersion());
         s.sendMessage("§ePlatform: §a" + plugin.platform());
-        long surface = plugin.views.values().stream().filter(AntiFreeCam.View::surface).count();
+        long surface = plugin.views.values().stream().filter(View::surface).count();
         s.sendMessage("§ePlayers with filtered view: §a" + plugin.views.size() + " §7(" + surface + " above ground, "
                 + (plugin.views.size() - surface) + " depth-limited)");
         s.sendMessage("§eProtected worlds: §a" + plugin.worlds.size());
         s.sendMessage("§eDebug: §a" + (plugin.debug ? "on" : "off"));
-        if (!b.enabled) {
-            s.sendMessage("§eBedrock detection: §7off");
-            return;
-        }
-        s.sendMessage("§eBedrock detection: §aon §7(Geyser " + mark(b.useGeyser && b.geyserPresent())
-                + "§7, Floodgate " + mark(b.useFloodgate && b.floodgatePresent())
-                + "§7, UUID " + mark(b.useUuid)
-                + "§7, prefix " + mark(b.useNames) + " §7" + b.prefixes + ")");
-        s.sendMessage("§eBedrock players online: §a" + b.onlineCount());
-    }
-
-    private static String mark(boolean on) {
-        return on ? "§a✓" : "§c✗";
     }
 
     private void test(CommandSender s, String[] args) {
@@ -151,7 +143,7 @@ final class Commands implements TabExecutor {
         switch (args.length > 0 ? args[0].toLowerCase(Locale.ROOT) : "") {
             case "block" -> send(s, "§7Replacement block: §f" + plugin.replacementName + " §7(state id " + plugin.replacementId + ")");
             case "state" -> {
-                AntiFreeCam.View view = plugin.views.get(p.getUniqueId());
+                View view = plugin.views.get(p.getUniqueId());
                 String hidden = view == null ? "nothing" : (view.maxHiddenY() < view.minY() ? "nothing below"
                         : "Y <= " + view.maxHiddenY() + (view.surface() ? " (above ground)" : " (depth limit)"))
                         + (view.occlude() ? ", plus unreachable caves" : "");

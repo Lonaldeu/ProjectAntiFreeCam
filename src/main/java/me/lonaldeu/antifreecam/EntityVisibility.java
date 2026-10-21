@@ -1,5 +1,6 @@
 package me.lonaldeu.antifreecam;
 
+import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.World;
@@ -52,7 +53,7 @@ final class EntityVisibility {
         volatile int[] hiddenIds = new int[0]; // read by netty threads
         volatile double[] positions = new double[0]; // x, y, z, hidden (1 or 0) per nearby entity; read by netty threads
         Vector lastEye;
-        int check;
+        int check, tick;
     }
 
     /** The last line-of-sight answer for one entity, and what it was computed from. */
@@ -74,15 +75,18 @@ final class EntityVisibility {
         return viewers.computeIfAbsent(id, k -> new Viewer());
     }
 
-    void start(Player viewer) {
-        long offset = ThreadLocalRandom.current().nextLong(plugin.losInterval); // spread viewers over ticks
-        viewer.getScheduler().runAtFixedRate(plugin, t -> {
+    /** Runs every tick and checks every check-interval-ticks, so a changed interval applies to everyone at once. */
+    void start(Player player) {
+        Viewer v = viewer(player.getUniqueId());
+        v.tick = ThreadLocalRandom.current().nextInt(1 << 16); // spread viewers over ticks
+        player.getScheduler().runAtFixedRate(plugin, t -> {
+            if (++v.tick % plugin.losInterval != 0) return;
             try {
-                check(viewer);
+                check(player, v);
             } catch (RuntimeException e) { // e.g. an entity owned by another Folia region; try again next time
-                if (plugin.debug) plugin.getLogger().warning("Entity visibility check failed for " + viewer.getName() + ": " + e);
+                if (plugin.debug) plugin.getLogger().warning("Entity visibility check failed for " + player.getName() + ": " + e);
             }
-        }, null, 1 + offset, plugin.losInterval);
+        }, null, 1, 1);
     }
 
     /** Called from netty threads when the packet filter drops an entity's spawn for {@code viewer}. */
@@ -124,43 +128,80 @@ final class EntityVisibility {
         return hidden;
     }
 
-    void forget(UUID viewer) {
-        viewers.remove(viewer);
+    /**
+     * A player left: forget them as a viewer, and take them off the tab list of everyone they were hidden from. The
+     * server only tells players who can see them that they left, and hidden ones were kept in the tab list.
+     */
+    void quit(UUID player) {
+        viewers.remove(player);
+        Nms nms = plugin.nms;
+        viewers.forEach((viewerId, v) -> {
+            v.droppedSpawns.remove(player);
+            if (!v.hidden.remove(player)) return;
+            v.keepInTab.remove(player);
+            Player viewer = Bukkit.getPlayer(viewerId);
+            if (viewer != null && nms.playerInfoRemovePacket != null) nms.send(viewer, nms.playerInfoRemove(List.of(player)));
+        });
     }
 
-    private void check(Player player) {
-        Viewer v = viewer(player.getUniqueId());
+    /**
+     * Shows everything this plugin hid, so nothing stays hidden once it is disabled. (Paper allows showing, not
+     * hiding, from onDisable, so spawns dropped in the last couple of ticks stay unsent until they come back in range.)
+     */
+    void showAll() {
+        viewers.forEach((viewerId, v) -> {
+            Player p = Bukkit.getPlayer(viewerId);
+            if (p == null) return;
+            for (UUID id : v.hidden) {
+                try {
+                    Entity e = Bukkit.getEntity(id);
+                    if (e != null) p.showEntity(plugin, e);
+                } catch (RuntimeException ignored) { // e.g. an entity of another Folia region at shutdown
+                }
+            }
+        });
+        viewers.clear();
+    }
+
+    private void check(Player player, Viewer v) {
         int check = ++v.check;
         World world = player.getWorld();
-        AntiFreeCam.View view = plugin.views.get(player.getUniqueId());
+        View view = plugin.views.get(player.getUniqueId());
         boolean depth = plugin.hideEntities && view != null;
         boolean sightRule = plugin.lineOfSight && plugin.worlds.contains(world.getName())
                 && player.getGameMode() != GameMode.SPECTATOR && !player.hasPermission("antifreecam.bypass");
         Vector eye = player.getEyeLocation().toVector();
-        Vector predicted = sightRule ? predictEye(player, v, world, eye) : null;
+        Map<Long, Boolean> blocks = new HashMap<>(); // rays to nearby entities cross the same blocks: look each up once
+        Raycast.Solid solid = (x, y, z) -> blocks.computeIfAbsent(blockKey(x, y, z), k -> world.getType(x, y, z).isOccluding());
+        Vector predicted = sightRule ? predictEye(player, v, solid, eye) : null;
         long eyeBlock = blockKey(eye.getBlockX(), eye.getBlockY(), eye.getBlockZ());
+        Entity vehicle = player.getVehicle();
+        List<Entity> passengers = player.getPassengers();
 
         double r = plugin.losMaxDistance;
+        // The server sends entities at any height, so with something height-hidden the whole height is checked.
+        double h = depth && view.maxHiddenY() >= view.minY() ? world.getMaxHeight() - world.getMinHeight() : r;
         Set<UUID> seen = new HashSet<>();
         List<Integer> hiddenIds = new ArrayList<>();
         List<Location> nearbyAt = new ArrayList<>();
         List<Boolean> nearbyHidden = new ArrayList<>();
-        for (Entity e : player.getNearbyEntities(r, r, r)) {
-            if (!plugin.trackedTypeKeys.contains(e.getType().getKey().toString())) continue;
+        for (Entity e : player.getNearbyEntities(r, h, r)) {
+            // Who sees an entity hidden by default is another plugin's call: showing it would show it to everyone.
+            if (!plugin.trackedTypes.contains(e.getType()) || !e.isVisibleByDefault()) continue;
             UUID id = e.getUniqueId();
             seen.add(id);
             boolean spawnWasDropped = v.droppedSpawns.remove(id);
             Location at = e.getLocation();
             boolean hide = depth && at.getY() <= view.maxHiddenY();
             if (hide) v.sight.remove(id); // out of the picture: start fresh when it comes back above the cut
-            else if (sightRule && !exempt(player, e)) {
+            else if (sightRule && Math.abs(at.getY() - eye.getY()) <= r && !exempt(e, vehicle, passengers)) {
                 Sight s = v.sight.computeIfAbsent(id, k -> new Sight());
                 long entityBlock = blockKey(at.getBlockX(), at.getBlockY(), at.getBlockZ());
                 boolean far = at.toVector().distanceSquared(eye) > FAR * FAR;
                 int maxAge = s.clear ? (far ? 2 * REUSE_CHECKS : REUSE_CHECKS) : (far ? 2 : 1);
                 if (s.computedAt == 0 || s.viewerBlock != eyeBlock || s.entityBlock != entityBlock || check - s.computedAt >= maxAge) {
                     BoundingBox box = e.getBoundingBox();
-                    s.clear = canSee(world, eye, box) || (predicted != null && canSee(world, predicted, box));
+                    s.clear = canSee(solid, eye, box) || (predicted != null && canSee(solid, predicted, box));
                     s.viewerBlock = eyeBlock;
                     s.entityBlock = entityBlock;
                     s.computedAt = check;
@@ -176,19 +217,30 @@ final class EntityVisibility {
             nearbyAt.add(at);
             nearbyHidden.add(hide);
             if (hide) {
-                if (v.hidden.add(id)) hideKeepingTab(player, v, e);
+                v.hidden.add(id);
+                // Also when already marked: the server forgets its own hide when the entity unloads, changes world or
+                // relogs, and then sends it again.
+                if (player.canSee(e)) hideKeepingTab(player, v, e);
                 hiddenIds.add(e.getEntityId());
-            } else if (v.hidden.remove(id)) {
-                player.showEntity(plugin, e);
             } else if (spawnWasDropped) { // the client never got this entity: have the server send it now
+                v.hidden.remove(id);
                 hideKeepingTab(player, v, e);
+                player.showEntity(plugin, e);
+            } else if (v.hidden.remove(id)) {
                 player.showEntity(plugin, e);
             }
         }
         v.sight.keySet().retainAll(seen);
-        // shortcut: entities that left range stay marked until seen again (the server keeps its own hidden record too)
-        if (v.hidden.size() > 1024) v.hidden.retainAll(seen);
-        if (v.droppedSpawns.size() > 1024) v.droppedSpawns.clear();
+        // Entities that left range stay marked until seen again: the server keeps hiding them too. Only the gone ones
+        // are dropped, as the server forgets those. shortcut: rescans every check while over 1024 live ones are hidden
+        if (v.hidden.size() > 1024) {
+            try {
+                v.hidden.removeIf(id -> !seen.contains(id) && Bukkit.getEntity(id) == null);
+            } catch (RuntimeException e) { // e.g. Folia refusing a lookup from this thread: try again next time
+                if (plugin.debug) plugin.getLogger().warning("Could not prune hidden entities for " + player.getName() + ": " + e);
+            }
+        }
+        settleDroppedSpawns(player, v, world, depth ? view : null, seen);
 
         v.hiddenIds = hiddenIds.stream().mapToInt(Integer::intValue).toArray();
         double[] positions = new double[nearbyAt.size() * 4];
@@ -201,16 +253,45 @@ final class EntityVisibility {
         v.positions = positions;
     }
 
+    /**
+     * Dropped spawns of entities the pass didn't look at (farther away than max-distance): those still in the hidden
+     * range get hidden through the server too, which otherwise keeps sending their movement and so their position;
+     * the others are sent. Entities seen this check wait for the next one, which knows about line of sight.
+     */
+    private void settleDroppedSpawns(Player player, Viewer v, World world, View view, Set<UUID> seen) {
+        for (UUID id : v.droppedSpawns) {
+            if (seen.contains(id)) continue;
+            try {
+                Entity e = Bukkit.getEntity(id);
+                if (e != null && e.isVisibleByDefault() && e.getWorld().equals(world)) {
+                    if (view != null && e.getLocation().getY() <= view.maxHiddenY()) {
+                        v.hidden.add(id);
+                        if (player.canSee(e)) hideKeepingTab(player, v, e);
+                    } else {
+                        v.hidden.remove(id);
+                        hideKeepingTab(player, v, e);
+                        player.showEntity(plugin, e);
+                    }
+                }
+                v.droppedSpawns.remove(id);
+            } catch (RuntimeException e) { // e.g. owned by another Folia region: try again next time
+                if (plugin.debug) plugin.getLogger().warning("Could not settle a dropped spawn for " + player.getName() + ": " + e);
+            }
+        }
+        if (v.droppedSpawns.size() > 1024) v.droppedSpawns.clear(); // only if settling keeps failing
+    }
+
     private static long blockKey(int x, int y, int z) {
         return ((long) x & 0x3FFFFFF) << 38 | ((long) z & 0x3FFFFFF) << 12 | (y & 0xFFF);
     }
 
-    private static boolean exempt(Player viewer, Entity e) {
-        return e.isGlowing() || e.equals(viewer.getVehicle()) || e.getPassengers().contains(viewer) || viewer.getPassengers().contains(e);
+    private static boolean exempt(Entity e, Entity vehicle, List<Entity> passengers) {
+        return e.isGlowing() || e.equals(vehicle) || passengers.contains(e);
     }
 
+    /** Hides {@code e}; a player stays in the tab list when the hide makes the server take them off it. */
     private void hideKeepingTab(Player player, Viewer v, Entity e) {
-        if (e instanceof Player) v.keepInTab.put(e.getUniqueId(), System.currentTimeMillis() + TAB_KEEP_MS);
+        if (e instanceof Player && player.canSee(e)) v.keepInTab.put(e.getUniqueId(), System.currentTimeMillis() + TAB_KEEP_MS);
         player.hideEntity(plugin, e);
     }
 
@@ -219,7 +300,7 @@ final class EntityVisibility {
      * since the last check, carried forward over the check interval plus their ping. Cuts pop-in when rounding a
      * corner. Not used when a solid block lies on the way, so pushing into a wall never lets anyone see through it.
      */
-    private Vector predictEye(Player player, Viewer v, World world, Vector eye) {
+    private Vector predictEye(Player player, Viewer v, Raycast.Solid solid, Vector eye) {
         Vector last = v.lastEye;
         v.lastEye = eye;
         if (last == null) return null;
@@ -228,21 +309,15 @@ final class EntityVisibility {
         if (length < 0.01 || length > MAX_PREDICTED_STEP) return null;
         double ahead = 1 + Math.min(player.getPing(), 500) / 50.0 / plugin.losInterval;
         Vector predicted = eye.clone().add(step.multiply(ahead));
-        Raycast.Solid solid = solid(world);
         boolean blocked = solid.at(predicted.getBlockX(), predicted.getBlockY(), predicted.getBlockZ())
                 || !Raycast.clear(eye.getX(), eye.getY(), eye.getZ(), predicted.getX(), predicted.getY(), predicted.getZ(), solid);
         return blocked ? null : predicted;
     }
 
-    private static Raycast.Solid solid(World world) {
-        return (x, y, z) -> world.getType(x, y, z).isOccluding();
-    }
-
-    private boolean canSee(World world, Vector eye, BoundingBox box) {
+    private boolean canSee(Raycast.Solid solid, Vector eye, BoundingBox box) {
         double ex = eye.getX(), ey = eye.getY(), ez = eye.getZ();
         double near = plugin.losAlwaysVisible;
         if (box.getCenter().distanceSquared(eye) <= near * near) return true;
-        Raycast.Solid solid = solid(world);
         double inset = 0.05;
         double minX = box.getMinX() + inset, minY = box.getMinY() + inset, minZ = box.getMinZ() + inset;
         double maxX = box.getMaxX() - inset, maxY = box.getMaxY() - inset, maxZ = box.getMaxZ() - inset;

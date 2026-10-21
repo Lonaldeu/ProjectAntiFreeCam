@@ -42,7 +42,7 @@ entities:
     check-interval-ticks: 2
     # Entities this close are always shown.
     always-visible-distance: 3
-    # Entities farther than this aren't checked.
+    # Entities farther than this aren't checked for line of sight (the hidden range still applies).
     max-distance: 64
   # Entity types that get hidden (types this server version doesn't have are skipped). Players
   # always are. An empty list hides players only.

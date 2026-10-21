@@ -7,17 +7,21 @@ import org.bukkit.World;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 
+import java.lang.ref.Reference;
+import java.lang.reflect.AccessibleObject;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiConsumer;
+import java.util.function.Predicate;
 import java.util.logging.Logger;
 
 /**
@@ -48,6 +52,7 @@ final class Nms {
     private Method soundEntityId;
     private Class<?> explodePacket;
     private Method[] explodePosition; // getX, getY, getZ; or since 1.21.2 center, then its x, y, z
+    private Field explodeBlocks; // the destroyed blocks, sent until 1.21.2
     // Tab-list removal; null when unavailable (line-of-sight culling then briefly drops players from the tab list).
     Class<?> playerInfoRemovePacket;
     private Method profileIds;
@@ -56,6 +61,17 @@ final class Nms {
     private Method worldHandle, chunkSource, chunkNow, lightEngine, playerHandle, sendPacket;
     private Field playerConnection;
     private Constructor<?> newChunkPacket;
+    // Pairing one entity with one player through the server's entity tracker; trackerUpdate is null when unavailable.
+    private Method entityHandle, trackedEntityOf, trackerRemove, trackerUpdate;
+    private Field trackerField;
+    // Whether other plugins hide an entity, and listing a player again; invertedVisibility is null when unavailable.
+    private Field invertedVisibility;
+    private Method newPlayerInfoAdd;
+    // Packets about one entity (movement, data, equipment and the like): their entity id field, by class. Empty, and
+    // addedEntityId null, when unavailable.
+    private final Map<Class<?>, Field> entityIdField = new HashMap<>();
+    private Method addedEntityId, removedEntityIds;
+    Class<?> removeEntitiesPacket;
     private final Method entityUuid;
     // Cave occlusion; opaque is null when unavailable, and occlusion is then off.
     boolean[] opaque; // by block state id: blocks sight (solid render, or has a block entity)
@@ -149,6 +165,7 @@ final class Nms {
             Class<?> c = Class.forName(GAME + "ClientboundExplodePacket");
             try {
                 explodePosition = new Method[]{c.getMethod("getX"), c.getMethod("getY"), c.getMethod("getZ")};
+                explodeBlocks = accessible(c.getDeclaredField("toBlow"));
             } catch (NoSuchMethodException since1212) {
                 Method center = c.getMethod("center");
                 Class<?> vec = center.getReturnType();
@@ -183,6 +200,65 @@ final class Nms {
         } catch (ReflectiveOperationException e) {
             log.warning("Chunk refreshes will go to every nearby player on this version: " + e);
             newChunkPacket = null;
+        }
+
+        try {
+            if (sendPacket == null) throw new NoSuchMethodException("player access");
+            entityHandle = Class.forName("org.bukkit.craftbukkit.entity.CraftEntity").getMethod("getHandle");
+            Class<?> tracked = Class.forName("net.minecraft.server.level.ChunkMap$TrackedEntity");
+            Class<?> serverPlayer = Class.forName("net.minecraft.server.level.ServerPlayer");
+            trackerRemove = accessible(tracked.getDeclaredMethod("removePlayer", serverPlayer));
+            trackerUpdate = accessible(tracked.getDeclaredMethod("updatePlayer", serverPlayer));
+            Class<?> entity = Class.forName("net.minecraft.world.entity.Entity");
+            try { // each entity knows its tracker: a method since 1.21, Paper's own field before
+                trackedEntityOf = entity.getMethod("moonrise$getTrackedEntity");
+            } catch (NoSuchMethodException before121) {
+                trackerField = entity.getField("tracker");
+            }
+        } catch (ReflectiveOperationException e) {
+            log.warning("Entities other plugins show to some players only aren't hidden underground on this version: " + e);
+            trackerUpdate = null;
+        }
+
+        try {
+            if (sendPacket == null || playerInfoRemovePacket == null) throw new NoSuchMethodException("player access");
+            invertedVisibility = accessible(Class.forName("org.bukkit.craftbukkit.entity.CraftPlayer")
+                    .getDeclaredField("invertedVisibilityEntities"));
+            Class<?> update = Class.forName(GAME + "ClientboundPlayerInfoUpdatePacket");
+            try { // Paper's: lists the player only where Player#unlistPlayer allows
+                newPlayerInfoAdd = update.getMethod("createPlayerInitializing", Collection.class,
+                        Class.forName("net.minecraft.server.level.ServerPlayer"));
+            } catch (NoSuchMethodException vanilla) {
+                newPlayerInfoAdd = update.getMethod("createPlayerInitializing", Collection.class);
+            }
+        } catch (ReflectiveOperationException e) {
+            log.warning("Vanished players hidden by line of sight stay in the tab list on this version: " + e);
+            invertedVisibility = null;
+        }
+
+        try {
+            addedEntityId = method(addEntityPacket, "getId", "id");
+            removeEntitiesPacket = Class.forName(GAME + "ClientboundRemoveEntitiesPacket");
+            removedEntityIds = method(removeEntitiesPacket, "getEntityIds", "entityIds");
+            for (String name : List.of("ClientboundMoveEntityPacket$Pos", "ClientboundMoveEntityPacket$PosRot",
+                    "ClientboundMoveEntityPacket$Rot", "ClientboundTeleportEntityPacket", "ClientboundEntityPositionSyncPacket",
+                    "ClientboundSetEntityDataPacket", "ClientboundSetEquipmentPacket", "ClientboundUpdateAttributesPacket",
+                    "ClientboundRotateHeadPacket", "ClientboundSetEntityMotionPacket", "ClientboundAnimatePacket",
+                    "ClientboundEntityEventPacket", "ClientboundHurtAnimationPacket", "ClientboundSetPassengersPacket",
+                    "ClientboundUpdateMobEffectPacket", "ClientboundRemoveMobEffectPacket", "ClientboundMoveMinecartPacket",
+                    "ClientboundDamageEventPacket")) {
+                Class<?> c;
+                try {
+                    c = Class.forName(GAME + name);
+                } catch (ClassNotFoundException notOnThisVersion) { // e.g. position sync and minecart moves are newer
+                    continue;
+                }
+                entityIdField.put(c, entityIdField(c));
+            }
+        } catch (ReflectiveOperationException e) {
+            log.warning("Updates about entities whose spawn was held back still go out on this version: " + e);
+            addedEntityId = null;
+            entityIdField.clear();
         }
 
         try {
@@ -321,6 +397,80 @@ final class Nms {
         return packet == null || send(p, packet); // unloaded meanwhile: nothing to send
     }
 
+    /**
+     * Has the server send entity {@code e} to this player again, as if it had just come into range (when they may
+     * see it). False when that isn't possible on this version. On the entity's thread.
+     */
+    boolean resendEntity(Player p, org.bukkit.entity.Entity e) {
+        Object tracked = trackedEntity(e);
+        if (tracked == null) return false;
+        Object player = call(playerHandle, p);
+        call(trackerRemove, tracked, player);
+        call(trackerUpdate, tracked, player);
+        return true;
+    }
+
+    /** Has the server take entity {@code e} off this player's client; it may send it again by itself. On the entity's thread. */
+    boolean untrackEntity(Player p, org.bukkit.entity.Entity e) {
+        Object tracked = trackedEntity(e);
+        if (tracked == null) return false;
+        call(trackerRemove, tracked, call(playerHandle, p));
+        return true;
+    }
+
+    private Object trackedEntity(org.bukkit.entity.Entity e) {
+        if (trackerUpdate == null) return null;
+        Object entity = call(entityHandle, e);
+        return trackedEntityOf != null ? call(trackedEntityOf, entity) : get(trackerField, entity);
+    }
+
+    /** Whether a plugin other than {@code self} hides {@code entity} (visible by default) from {@code viewer}. Viewer's thread. */
+    boolean hiddenByOthers(Player viewer, org.bukkit.entity.Entity entity, Object self) {
+        if (invertedVisibility == null) return false;
+        Set<?> plugins = (Set<?>) ((Map<?, ?>) get(invertedVisibility, viewer)).get(entity.getUniqueId());
+        if (plugins == null) return false;
+        for (Object plugin : plugins) if (plugin == null || ((Reference<?>) plugin).get() != self) return true;
+        return false;
+    }
+
+    /** A packet listing {@code p} in {@code viewer}'s tab list again, or null when unavailable on this version. */
+    Object playerInfoAdd(Player viewer, Player p) {
+        if (invertedVisibility == null) return null;
+        List<Object> players = List.of(call(playerHandle, p));
+        return newPlayerInfoAdd.getParameterCount() == 2 ? call(newPlayerInfoAdd, null, players, call(playerHandle, viewer))
+                : call(newPlayerInfoAdd, null, players);
+    }
+
+    /** The entity id field of a packet about one entity: entityId, id, entity or vehicle, here or in a superclass. */
+    private static Field entityIdField(Class<?> packet) throws NoSuchFieldException {
+        for (Class<?> c = packet; c != Object.class; c = c.getSuperclass())
+            for (String name : List.of("entityId", "id", "entity", "vehicle")) {
+                try {
+                    Field f = c.getDeclaredField(name);
+                    if (f.getType() == int.class && !java.lang.reflect.Modifier.isStatic(f.getModifiers())) return accessible(f);
+                } catch (NoSuchFieldException tryNext) {
+                    // next name
+                }
+            }
+        throw new NoSuchFieldException(packet.getName() + ": entity id");
+    }
+
+    /** The id of the entity an add-entity packet spawns, or -1 when unavailable on this version. */
+    int addedEntityId(Object addEntity) {
+        return addedEntityId == null ? -1 : (int) call(addedEntityId, addEntity);
+    }
+
+    /** The ids of the entities a remove-entities packet removes. */
+    Iterable<?> removedEntityIds(Object removeEntities) {
+        return (Iterable<?>) call(removedEntityIds, removeEntities);
+    }
+
+    /** The entity a packet about one entity (movement, data, equipment and the like) is about, else -1. */
+    int entityIdOf(Object packet) {
+        Field f = entityIdField.get(packet.getClass());
+        return f == null ? -1 : (int) get(f, packet);
+    }
+
     /** Sends a packet to this player, through their filter. False when that isn't possible on this version. Any thread. */
     boolean send(Player p, Object packet) {
         if (sendPacket == null) return false;
@@ -446,6 +596,18 @@ final class Nms {
         return new double[]{(double) call(xyz[0], packet), (double) call(xyz[1], packet), (double) call(xyz[2], packet)};
     }
 
+    /**
+     * An explosion packet without the destroyed blocks {@code hidden} says the client holds as replacement (only sent
+     * until 1.21.2); any other packet as it is.
+     */
+    Object explosionWithout(Object packet, Predicate<int[]> hidden) {
+        if (explodeBlocks == null || packet.getClass() != explodePacket) return packet;
+        List<?> blocks = (List<?>) get(explodeBlocks, packet);
+        List<Object> kept = new ArrayList<>(blocks.size());
+        for (Object pos : blocks) if (!hidden.test(xyz(pos))) kept.add(pos);
+        return kept.size() == blocks.size() ? packet : Copies.with(packet, "toBlow", kept);
+    }
+
     private double[] explosionPosition(Object packet) {
         Method[] m = explodePosition;
         Object at = m.length == 4 ? call(m[0], packet) : packet;
@@ -481,9 +643,9 @@ final class Nms {
         return call(entityTypeKey, null, call(entityType, packet)).toString();
     }
 
-    private static Field accessible(Field f) {
-        f.setAccessible(true);
-        return f;
+    private static <T extends AccessibleObject> T accessible(T member) {
+        member.setAccessible(true);
+        return member;
     }
 
     private static Object get(Field f, Object target) {

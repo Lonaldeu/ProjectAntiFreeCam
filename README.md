@@ -14,7 +14,8 @@ and entities are never sent to the client, so there is nothing for a modified cl
   reveals them within a few ticks.
 - **Line-of-sight culling (anti-ESP).** Players and listed mobs behind solid blocks aren't sent until they come into
   view, checked from where the player is about to be so they don't pop in late. Something that walks behind a pillar
-  stays shown for a moment instead of flickering, and hidden players stay in the tab list.
+  stays shown for a moment instead of flickering, and hidden players stay in the tab list (unless a vanish plugin
+  hides them too).
 - **Closes side channels.** In everything it hides it also removes block light (torches, lava), biomes (deep dark marks
   ancient cities), block entities (chests, spawners), block events, mining cracks, explosions, sounds and particles —
   including the footsteps and other sounds of entities hidden behind walls.
@@ -129,13 +130,12 @@ Not tested yet: ViaVersion, real Bedrock clients, and large player counts.
 - Breaking into a hidden pocket far from the player (someone else mining, an explosion) shows stone for a few ticks
   before the pocket appears. Next to the player it is instant.
 - An entity behind a wall can take up to about two ticks plus the player's ping to appear when they step into view.
-- An entity the player already got that goes below the hidden level more than `max-distance` (64) blocks away
-  sideways is still sent until it comes closer. Entities that are already down there when the player comes near
-  are never sent.
+- Entities farther away than `max-distance` (64 blocks) are only checked against the hidden range, about every
+  ten ticks: one that goes underground over there is sent for up to half a second longer.
 - Dropped items, experience orbs and boats aren't in the default `hidden-types`: listing them costs a
   line-of-sight check each.
-- Entities another plugin makes invisible by default (per-player holograms and markers) are left to that plugin: it
-  decides who sees them.
+- Line of sight leaves entities that another plugin shows to some players only (per-player holograms and markers) to
+  that plugin; the hidden range still applies to them.
 - On Folia, if nearby entities belong to a different region than the player, that entity check is skipped and
   retried on the next one.
 
@@ -159,8 +159,10 @@ docker run --rm -v "$PWD:/work" -w /work gradle:9.2.1-jdk21 gradle build
 they actually receive: hidden terrain, light, biomes and block entities on the wire, entities crossing the hidden
 level, line of sight through stone and glass, the tab list, that refreshes reach only the player who needs them, cave
 occlusion (sealed pockets arrive as stone, opening one reveals it, spectators see everything), sounds at hidden
-entities, hidden players who quit or relog, and world changes. A run also fails when the server log shows the
-plugin sending anything unfiltered.
+entities, hidden players who quit or relog, vanished players, per-player holograms, explosions, entities beyond
+`max-distance`, and world changes. A run also fails when the server log shows the plugin sending anything unfiltered.
+It also loads a small test plugin (`e2e/testplugin`, built with the plugin into `build/e2e/`) that stands in for a
+vanish plugin and a per-player hologram plugin.
 It needs Docker, Node.js and curl.
 
 ```bash

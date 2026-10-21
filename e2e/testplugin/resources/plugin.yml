@@ -1,0 +1,12 @@
+name: AfcTestPlugin
+version: '1'
+main: afctest.TestPlugin
+api-version: '1.20'
+description: Test helpers for e2e/run.sh, not for real servers.
+folia-supported: true
+
+commands:
+  afcvanish:
+    usage: /afcvanish <player> on|off
+  afcprivate:
+    usage: /afcprivate <player> <x> <y> <z>

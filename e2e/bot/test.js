@@ -1,4 +1,5 @@
-// End-to-end check of ProjectAntiFreeCam against a flat world: bedrock -64, stone -63..36, grass 37.
+// End-to-end check of ProjectAntiFreeCam against a flat world: bedrock -64, stone -63..36, grass 37. View distance 6.
+// AfcTestPlugin (e2e/testplugin) provides /afcvanish and /afcprivate, standing in for other plugins.
 // Defaults: above ground at Y >= 31 (full view back below 29): Y <= 16 hidden.
 // Below that: sections more than 48 blocks below the player are hidden (at Y 20: Y <= -33).
 const mineflayer = require('mineflayer')
@@ -88,6 +89,10 @@ bot.once('spawn', async () => {
   bot.chat(`/setblock ${x + 9} 7 ${z + 9} minecraft:chest`)
   bot.chat(`/fillbiome ${x - 8} -48 ${z - 8} ${x + 8} -16 ${z + 8} minecraft:deep_dark`)
   roomChunk = [(x + 9) >> 4, (z + 9) >> 4]
+  // a hologram another plugin shows to this player only, below the cut
+  bot.chat(`/afcprivate AfcBot ${x + 5.5} 10 ${z + 5.5}`)
+  const privateSeen = () => Object.values(bot.entities).some(e => e.name === 'text_display'
+    && Math.abs(e.position.x - (x + 5.5)) < 1 && Math.abs(e.position.z - (z + 5.5)) < 1)
   await sleep(2500)
   check('surface: underground armor stand hidden, surface one shown', JSON.stringify(stands()) === '[30]', JSON.stringify(stands()))
   check('surface: single block change below limit hidden', name(x + 2, 5, z + 2) === 'air', name(x + 2, 5, z + 2))
@@ -95,6 +100,7 @@ bot.once('spawn', async () => {
   check('surface: multi block change split at limit',
     [14, 16, 17, 20].map(y => name(x - 5, y, z - 5)).join() === 'air,air,emerald_block,emerald_block',
     [14, 16, 17, 20].map(y => name(x - 5, y, z - 5)).join())
+  check('surface: a per-player hologram below the cut is hidden', !privateSeen())
 
   // Entities that cross the cut after spawning: one cart goes down into the hidden range, one comes up out of it.
   // which side of the bot each visible cart is on: -1 for the one summoned at x-2, 1 for the one at x+2
@@ -108,6 +114,21 @@ bot.once('spawn', async () => {
   await sleep(1500)
   check('crossing: the cart that went down vanished, the one that came up appeared', JSON.stringify(carts()) === '[1]', JSON.stringify(carts()))
 
+  // Explosions: one below the cut isn't sent; one just above it is, without the blocks it destroyed at or below the
+  // cut (which the packet only lists before 1.21.2).
+  const explosions = []
+  bot._client.on('explosion', p => explosions.push(p))
+  bot.chat(`/summon tnt ${x + 40.5} 5 ${z + 0.5} {fuse:0}`)
+  await sleep(1500)
+  check('explosion: one below the cut is not sent', explosions.length === 0, `${explosions.length} sent`)
+  bot.chat(`/fill ${x + 39} 14 ${z - 1} ${x + 41} 16 ${z + 1} minecraft:dirt`) // weak blocks under it: the blast surely
+  bot.chat(`/fill ${x + 39} 17 ${z - 1} ${x + 41} 17 ${z + 1} minecraft:air`) // reaches below the cut
+  bot.chat(`/summon tnt ${x + 40.5} 17 ${z + 0.5} {fuse:0}`)
+  await sleep(1500)
+  const blown = explosions.flatMap(p => (p.affectedBlockOffsets || []).map(o => Math.floor(p.y) + o.y))
+  check('explosion: one above the cut is sent, without blocks at or below it', explosions.length === 1 && blown.every(y => y > 16),
+    `${explosions.length} sent, destroyed Y ${[...new Set(blown)].sort((a, b) => a - b)}`)
+
   // 2. Below the protection level: depth-limited view. At Y 20 the cut is Y <= -33.
   phase = 'depth'
   await tp(20)
@@ -120,6 +141,8 @@ bot.once('spawn', async () => {
   const biome = y => block(x, y, z)?.biome?.id
   check('depth: real biome within view (deep dark differs from surface plains)', biome(-30) !== biome(30), `${biome(-30)} vs ${biome(30)}`)
   check('depth: underground armor stand visible', JSON.stringify(stands()) === '[10,30]', JSON.stringify(stands()))
+  check('depth: the per-player hologram is sent within view', privateSeen())
+  const privateId = Object.values(bot.entities).find(e => e.name === 'text_display' && Math.abs(e.position.x - (x + 5.5)) < 1)?.id
 
   // 3. Back above ground, then down into the hysteresis band (29..31): still hidden.
   phase = 'surface'
@@ -129,6 +152,17 @@ bot.once('spawn', async () => {
   check('band: at Y 30 coming from above, still hidden', bad.length === 0, bad.join(' '))
   check('band: biome below the limit masked (same as surface)', biome(-30) === biome(30), `${biome(-30)} vs ${biome(30)}`)
   check('band: underground armor stand hidden', JSON.stringify(stands()) === '[30]', JSON.stringify(stands()))
+  check('band: the per-player hologram is hidden again', !privateSeen())
+  // ...and updates about it (data, movement) don't reach the client either, though the server keeps it paired.
+  const privateUpdates = []
+  const noteUpdate = p => { if (p.entityId === privateId) privateUpdates.push(p) }
+  for (const n of ['entity_metadata', 'entity_teleport', 'sync_entity_position', 'rel_entity_move', 'entity_move_look']) bot._client.on(n, noteUpdate)
+  const privateSel = `@e[type=text_display,x=${x + 5.5},y=10,z=${z + 5.5},distance=..1,limit=1]`
+  bot.chat(`/data merge entity ${privateSel} {billboard:"center"}`)
+  bot.chat(`/tp ${privateSel} ${x + 5.5} 11 ${z + 5.5}`)
+  await sleep(2000)
+  check('band: no updates about the hidden per-player hologram are sent', privateId !== undefined && privateUpdates.length === 0,
+    `id ${privateId}, ${privateUpdates.length} sent`)
   check('wire: no block entities at or below 16 sent while hidden', leakedBlockEntities === 0, `${leakedBlockEntities} leaked`)
   check('wire: no light for sections at or below 15 sent while hidden', leakedLight === 0, `${leakedLight} leaked`)
 
@@ -186,11 +220,37 @@ bot.once('spawn', async () => {
   bot2 = await joinBot2() // comes back where they left: behind the wall
   await sleep(2000)
   check('los: a hidden player who relogs stays hidden', !playerSeen() && !!bot.players.AfcBot2, seen())
+  // A vanish plugin hiding a player this plugin hides too: off the tab list, and back on when unvanished. The entity is
+  // looked up by UUID, as mineflayer can't name a player that isn't listed.
+  const bot2Uuid = bot.players.AfcBot2?.uuid
+  const bot2Seen = () => Object.values(bot.entities).some(e => e.type === 'player' && e.uuid === bot2Uuid)
+  bot.chat('/afcvanish AfcBot2 on')
+  await sleep(1500)
+  check('vanish: a vanished player hidden by line of sight leaves the tab list', !bot.players.AfcBot2)
+  bot.chat('/afcvanish AfcBot2 off')
+  await sleep(1500)
+  check('vanish: unvanished behind the wall, listed again and still hidden', !!bot.players.AfcBot2 && !bot2Seen(), seen())
+  bot.chat('/afcvanish AfcBot2 on')
+  await sleep(1500)
+  wall('air')
+  await sleep(1500)
+  check('vanish: in sight, a vanished player stays hidden and unlisted', !bot.players.AfcBot2 && !bot2Seen(), `seen=${bot2Seen()}`)
+  bot.chat('/afcvanish AfcBot2 off')
+  await sleep(1500)
   wall('air')
   await sleep(1500)
   check('los: both visible with the wall gone', standSeen() && playerSeen(), seen())
   check('los: tab list still intact', !!bot.players.AfcBot2)
   check('los: a sound at a visible entity is sent', await soundHeard())
+
+  // Beyond max-distance (64) there is no line-of-sight check, but the hidden range still applies.
+  const farSeen = () => Object.values(bot.entities).some(e => e.name === 'text_display' && e.position.x < x - 60)
+  bot.chat(`/summon text_display ${x - 69.5} 38 ${z + 0.5} {Tags:["far"]}`)
+  await sleep(2000)
+  check('far: an entity beyond max-distance above the cut is sent', farSeen())
+  bot.chat(`/tp @e[tag=far] ${x - 69.5} 10 ${z + 0.5}`) // (Folia's /tp spawns it anew, so only Paper proves the far pass)
+  await sleep(2000)
+  check('far: an entity beyond max-distance that goes below the cut is hidden', !farSeen())
 
   // 6. A view change re-sends chunks to that player only, not to the player standing next to them. As a spectator,
   // so cave occlusion (which re-sends what it reveals) can't stand in for the refresh.

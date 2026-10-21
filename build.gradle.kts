@@ -36,3 +36,16 @@ tasks.jar {
 tasks.processResources {
     filesMatching("plugin.yml") { expand("version" to version) }
 }
+
+// A small plugin e2e/run.sh adds to the test servers, standing in for a vanish plugin and a per-player hologram plugin.
+val e2ePlugin by sourceSets.creating {
+    java.srcDir("e2e/testplugin/src")
+    resources.srcDir("e2e/testplugin/resources")
+    compileClasspath += sourceSets.main.get().compileClasspath
+}
+val e2ePluginJar by tasks.registering(Jar::class) {
+    from(e2ePlugin.output)
+    archiveFileName = "AfcTestPlugin.jar"
+    destinationDirectory = layout.buildDirectory.dir("e2e")
+}
+tasks.build { dependsOn(e2ePluginJar) }

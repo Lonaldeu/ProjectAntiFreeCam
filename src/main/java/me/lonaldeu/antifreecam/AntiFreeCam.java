@@ -232,6 +232,12 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
             throw new IllegalStateException(e);
         }
         caveOcclusion = c.getBoolean("antixray.cave-occlusion", true);
+        // An existing config.yml keeps its old keys and values when the plugin is updated.
+        List<String> unused = List.of("bedrock", "performance.limited-area", "advanced.packet-processing.modify-chunk-data",
+                "advanced.packet-processing.modify-block-changes", "advanced.packet-processing.modify-multi-block-changes")
+                .stream().filter(c::isSet).toList();
+        if (!unused.isEmpty()) getLogger().warning("config.yml is from an older version: " + unused
+                + " are no longer used. See 'Upgrading' in the README for the new defaults.");
         settingsGeneration++;
     }
 

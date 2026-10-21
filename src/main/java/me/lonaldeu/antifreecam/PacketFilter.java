@@ -7,8 +7,11 @@ import io.netty.channel.ChannelPromise;
 import org.bukkit.entity.Player;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.UnaryOperator;
 
 /**
  * Sits in one player's netty pipeline, ahead of the packet encoder, and rewrites or drops outgoing packets that
@@ -32,6 +35,9 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     private UUID worldId; // event loop only: world of the last posted eye, for re-sends and recomputes
     private Object dimension; // event loop only: the dimension of the chunks the client holds
     private volatile Eye posted;
+    // Event loop only: entities whose spawn this filter dropped, so the client doesn't have them. Every packet about
+    // them is dropped too, until one spawns them or the client is told they are gone.
+    private final Set<Integer> spawnsDropped = new HashSet<>();
     private boolean warnedUnparsable, warnedFailure;
 
     /** Created on the player's own thread, before the filter is in the pipeline. */
@@ -91,6 +97,7 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
                 Object to = nms.respawnDimension(msg);
                 if (!to.equals(dimension)) occlusion.clear();
                 dimension = to;
+                spawnsDropped.clear(); // a respawn clears the client's entities
             } else if (type == nms.forgetPacket) {
                 occlusion.forget(nms.forgottenChunk(msg));
             }
@@ -102,6 +109,8 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
                 if (!track) occlusion.clear(); // switched off: nothing is sent as occluded any more
                 occlusion.view(view.minY(), view.maxHiddenY(), view.occlude() && track);
                 out = filter(msg, view.minY(), view.maxHiddenY());
+            } else if (!spawnsDropped.isEmpty()) {
+                out = withoutDroppedEntities(msg);
             }
         } catch (RuntimeException e) { // the packet goes out unfiltered, so say so at least once
             if (plugin.debug || !warnedFailure) plugin.getLogger().warning("Could not filter " + msg.getClass().getSimpleName()
@@ -129,7 +138,7 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     /** The packet to send in place of {@code msg}, or null to drop it. */
     private Object filter(Object msg, int minY, int maxY) {
         Class<?> type = msg.getClass();
-        if (type == nms.bundlePacket) return filterBundle(msg, minY, maxY);
+        if (type == nms.bundlePacket) return filterBundle(msg, part -> filter(part, minY, maxY));
         if (type == nms.chunkPacket) return filterChunk(msg, minY, maxY);
         if (type == nms.blockUpdatePacket) {
             int[] pos = nms.blockUpdatePos(msg);
@@ -139,24 +148,48 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
         }
         if (type == nms.sectionUpdatePacket) return filterSectionUpdate(msg, maxY);
         if (type == nms.addEntityPacket) {
-            if (nms.entityY(msg) > maxY || !plugin.hiddenTypeKeys.contains(nms.entityTypeKey(msg))) return msg;
+            if (nms.entityY(msg) > maxY || !plugin.hiddenTypeKeys.contains(nms.entityTypeKey(msg))) {
+                if (!spawnsDropped.isEmpty()) spawnsDropped.remove(nms.addedEntityId(msg));
+                return msg;
+            }
+            spawnsDropped.add(nms.addedEntityId(msg));
             plugin.entities.spawnDropped(id, nms.entityUuid(msg)); // so it gets sent if it later comes into view
             return null;
         }
+        if (aboutDroppedEntity(msg)) return null;
         if (!plugin.stripSideChannels) return msg;
         if (type == nms.lightUpdatePacket)
             return nms.withoutLight(msg, minY, maxY, occlusion.replacedMask(nms.lightX(msg), nms.lightZ(msg)));
         // Biome edits (/fillbiome) are rare; players with a hidden range get the new biomes on their next refresh.
         if (type == nms.chunksBiomesPacket) return null;
         int[] pos = nms.sideChannelPos(msg);
-        return pos != null && hidden(pos, maxY) ? null : msg;
+        if (pos == null) return msg;
+        return hidden(pos, maxY) ? null : nms.explosionWithout(msg, p -> hidden(p, maxY));
     }
 
-    private Object filterBundle(Object bundle, int minY, int maxY) {
+    /** With no view: packets about entities whose spawn was dropped are still held back, until they are sent. */
+    private Object withoutDroppedEntities(Object msg) {
+        if (msg.getClass() == nms.bundlePacket) return filterBundle(msg, this::withoutDroppedEntities);
+        if (msg.getClass() == nms.addEntityPacket) spawnsDropped.remove(nms.addedEntityId(msg));
+        return aboutDroppedEntity(msg) ? null : msg;
+    }
+
+    /** Whether a packet is about an entity whose spawn was dropped. A removal forgets the entities it lists. */
+    private boolean aboutDroppedEntity(Object msg) {
+        if (spawnsDropped.isEmpty()) return false;
+        if (msg.getClass() == nms.removeEntitiesPacket) {
+            for (Object entity : nms.removedEntityIds(msg)) spawnsDropped.remove(entity);
+            return false;
+        }
+        int entity = nms.entityIdOf(msg);
+        return entity >= 0 && spawnsDropped.contains(entity);
+    }
+
+    private Object filterBundle(Object bundle, UnaryOperator<Object> each) {
         List<Object> parts = new ArrayList<>();
         boolean changed = false;
         for (Object part : nms.subPackets(bundle)) {
-            Object filtered = filter(part, minY, maxY);
+            Object filtered = each.apply(part);
             changed |= filtered != part;
             if (filtered == null) continue;
             if (filtered.getClass() == nms.bundlePacket) parts.addAll(nms.subPackets(filtered)); // bundles can't nest

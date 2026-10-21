@@ -10,7 +10,11 @@ cd "$(dirname "$0")"
 here=$(pwd -W 2>/dev/null || pwd) # Docker on Windows (Git Bash) needs the Windows form of the path
 
 jar=$(ls ../build/libs/ProjectAntiFreeCam-*.jar 2>/dev/null | head -1)
-if [ "${1:-}" = --without-plugin ]; then
+testplugin=../build/e2e/AfcTestPlugin.jar # stands in for a vanish plugin and a per-player hologram plugin
+if [ ! -f "$testplugin" ]; then
+  echo "Build the plugin first (see README)."
+  exit 2
+elif [ "${1:-}" = --without-plugin ]; then
   jar=
   shift
 elif [ -z "$jar" ]; then
@@ -36,6 +40,7 @@ for target in "$@"; do
   # A fresh world and default config every run.
   rm -rf "$dir"/plugins/*.jar "$dir/plugins/ProjectAntiFreeCam" "$dir/world" "$dir/world_nether" "$dir/world_the_end"
   [ -z "$jar" ] || cp "$jar" "$dir/plugins/"
+  cp "$testplugin" "$dir/plugins/"
   cp server.properties "$dir/"
   echo eula=true > "$dir/eula.txt"
   echo "[{\"uuid\":\"$uuid\",\"name\":\"AfcBot\",\"level\":4,\"bypassesPlayerLimit\":false}]" > "$dir/ops.json"

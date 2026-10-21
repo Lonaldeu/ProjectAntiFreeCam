@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "description": "Bot client for the ProjectAntiFreeCam end-to-end test",
+  "dependencies": {
+    "mineflayer": "4.39.0",
+    "vec3": "0.1.10"
+  }
+}

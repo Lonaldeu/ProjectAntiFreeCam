@@ -1,6 +1,7 @@
 package me.lonaldeu.antifreecam;
 
 import io.netty.channel.Channel;
+import org.bukkit.World;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 import sun.misc.Unsafe;
@@ -48,6 +49,11 @@ final class Nms {
     Class<?> playerInfoRemovePacket;
     private Method profileIds;
     private Constructor<?> newPlayerInfoRemove;
+    // Sending one chunk to one player; null when unavailable (refreshes then go to every nearby player).
+    private Method worldHandle, chunkSource, chunkNow, lightEngine, playerHandle, sendPacket;
+    private Field playerConnection;
+    private Constructor<?> newChunkPacket;
+    private final Method entityUuid;
 
     Nms(Logger log) throws ReflectiveOperationException {
         chunkPacket = Class.forName(GAME + "ClientboundLevelChunkWithLightPacket");
@@ -75,6 +81,7 @@ final class Nms {
         newBundle = bundlePacket.getConstructor(Iterable.class);
         entityY = addEntityPacket.getMethod("getY");
         entityType = addEntityPacket.getMethod("getType");
+        entityUuid = addEntityPacket.getMethod("getUUID");
         entityTypeKey = entityTypeClass.getMethod("getKey", entityTypeClass);
         blockId = block.getMethod("getId", blockState);
 
@@ -128,6 +135,41 @@ final class Nms {
         } catch (ReflectiveOperationException e) {
             log.warning("Players hidden by line of sight will flicker in the tab list on this version: " + e);
         }
+
+        try {
+            Class<?> serverLevel = Class.forName("net.minecraft.server.level.ServerLevel");
+            worldHandle = Class.forName("org.bukkit.craftbukkit.CraftWorld").getMethod("getHandle");
+            chunkSource = serverLevel.getMethod("getChunkSource");
+            chunkNow = Class.forName("net.minecraft.server.level.ServerChunkCache").getMethod("getChunkNow", int.class, int.class);
+            lightEngine = serverLevel.getMethod("getLightEngine");
+            playerHandle = Class.forName("org.bukkit.craftbukkit.entity.CraftPlayer").getMethod("getHandle");
+            playerConnection = Class.forName("net.minecraft.server.level.ServerPlayer").getField("connection");
+            sendPacket = Class.forName("net.minecraft.server.network.ServerCommonPacketListenerImpl")
+                    .getMethod("send", Class.forName("net.minecraft.network.protocol.Packet"));
+            newChunkPacket = chunkPacket.getConstructor(Class.forName("net.minecraft.world.level.chunk.LevelChunk"),
+                    Class.forName("net.minecraft.world.level.lighting.LevelLightEngine"), BitSet.class, BitSet.class);
+        } catch (ReflectiveOperationException e) {
+            log.warning("Chunk refreshes will go to every nearby player on this version: " + e);
+            newChunkPacket = null;
+        }
+    }
+
+    /**
+     * Sends chunk (x, z) to this player only, from the chunk's owning thread. Returns false when that isn't possible
+     * on this version, so the caller can fall back to World#refreshChunk.
+     */
+    boolean sendChunk(Player p, World world, int x, int z) {
+        if (newChunkPacket == null) return false;
+        Object level = call(worldHandle, world);
+        Object chunk = call(chunkNow, call(chunkSource, level), x, z);
+        if (chunk == null) return true; // unloaded meanwhile: nothing to send
+        Object packet = construct(newChunkPacket, chunk, call(lightEngine, level), null, null);
+        call(sendPacket, get(playerConnection, call(playerHandle, p)), packet);
+        return true;
+    }
+
+    UUID entityUuid(Object addEntityPacket) {
+        return (UUID) call(entityUuid, addEntityPacket);
     }
 
     @SuppressWarnings("unchecked")

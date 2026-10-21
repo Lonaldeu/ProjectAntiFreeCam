@@ -6,7 +6,9 @@ import io.netty.channel.ChannelPromise;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Sits in one player's netty pipeline, ahead of the packet encoder, and rewrites or drops outgoing packets that
@@ -44,7 +46,7 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     /** Hiding a player behind a wall would also drop them from the tab list; keep them there. */
     private Object keepCulledPlayersInTab(Object packet) {
         List<UUID> ids = nms.profileIds(packet);
-        List<UUID> removed = ids.stream().filter(id -> !plugin.lineOfSightCuller.shouldKeepInTab(player, id)).toList();
+        List<UUID> removed = ids.stream().filter(id -> !plugin.entities.shouldKeepInTab(player, id)).toList();
         if (removed.size() == ids.size()) return packet;
         return removed.isEmpty() ? null : nms.playerInfoRemove(removed);
     }
@@ -57,8 +59,11 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
         // The client already shows the replacement there, so updates at or below the limit can simply be dropped.
         if (type == nms.blockUpdatePacket) return plugin.modifyBlockChanges && nms.blockUpdateY(msg) <= maxY ? null : msg;
         if (type == nms.sectionUpdatePacket) return plugin.modifyMultiBlockChanges ? filterSectionUpdate(msg, maxY) : msg;
-        if (type == nms.addEntityPacket)
-            return nms.entityY(msg) <= maxY && plugin.hiddenTypeKeys.contains(nms.entityTypeKey(msg)) ? null : msg;
+        if (type == nms.addEntityPacket) {
+            if (nms.entityY(msg) > maxY || !plugin.hiddenTypeKeys.contains(nms.entityTypeKey(msg))) return msg;
+            plugin.entities.spawnDropped(player, nms.entityUuid(msg)); // so it gets sent if it later comes into view
+            return null;
+        }
         if (!plugin.stripSideChannels) return msg;
         if (type == nms.lightUpdatePacket) return nms.withoutLight(msg, minY, maxY);
         // Biome edits (/fillbiome) are rare; players with a hidden range get the new biomes on their next refresh.
@@ -82,6 +87,17 @@ final class PacketFilter extends ChannelOutboundHandlerAdapter {
     }
 
     private Object filterChunk(Object packet, int minY, int maxY) {
+        long viewKey = (long) minY << 32 | (maxY & 0xFFFFFFFFL);
+        Map<Long, Object> done = plugin.rewrittenChunks.get(packet);
+        Object cached = done == null ? null : done.get(viewKey);
+        if (cached != null) return cached;
+        Object filtered = rewriteChunk(packet, minY, maxY);
+        // An unchanged packet isn't cached: as its own value it would keep the weak key alive forever.
+        if (filtered != packet) plugin.rewrittenChunks.computeIfAbsent(packet, k -> new ConcurrentHashMap<>()).put(viewKey, filtered);
+        return filtered;
+    }
+
+    private Object rewriteChunk(Object packet, int minY, int maxY) {
         byte[] in = nms.chunkBuffer(packet);
         byte[] out = ChunkSections.hideBelow(in, minY, maxY, plugin.replacementId, nms::isAir, nms.globalBlockBits);
         if (out == null) {

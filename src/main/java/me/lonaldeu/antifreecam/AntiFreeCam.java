@@ -3,11 +3,11 @@ package me.lonaldeu.antifreecam;
 import com.destroystokyo.paper.event.player.PlayerPostRespawnEvent;
 import io.netty.channel.Channel;
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.data.BlockData;
-import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -18,6 +18,7 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -25,6 +26,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class AntiFreeCam extends JavaPlugin implements Listener {
@@ -44,7 +46,11 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     private final Map<UUID, Long> nextRefreshAt = new ConcurrentHashMap<>();
     private final Set<UUID> refreshQueued = ConcurrentHashMap.newKeySet();
     final Bedrock bedrock = new Bedrock(this);
-    final LineOfSight lineOfSightCuller = new LineOfSight(this);
+    final EntityVisibility entities = new EntityVisibility(this);
+    // Chunk packets already rewritten, per original packet and view. Another plugin's World#refreshChunk sends one
+    // packet to every nearby player; most of them share a view, so it only needs rewriting once. Weak keys: entries
+    // go away with the packet.
+    final Map<Object, Map<Long, Object>> rewrittenChunks = Collections.synchronizedMap(new WeakHashMap<>());
     Nms nms;
 
     // Settings snapshot, read from netty threads too.
@@ -65,7 +71,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     volatile boolean lineOfSight;
     volatile long losInterval;
     volatile double losMaxDistance, losAlwaysVisible;
-    volatile Set<String> losTypeKeys = Set.of();
+    volatile Set<String> trackedTypeKeys = Set.of(); // the listed types plus players, for the visibility pass
 
     @Override
     public void onEnable() {
@@ -134,7 +140,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
     private void track(Player p) {
         hook(p);
         p.getScheduler().runAtFixedRate(this, t -> update(p, p.getLocation(), false), null, 1, 1);
-        lineOfSightCuller.start(p);
+        entities.start(p);
     }
 
     /** Adds the packet filter to the player's connection, just before the server's own packet handler. */
@@ -174,7 +180,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         for (String t : types.isEmpty() ? FALLBACK_TYPES : types) keys.add("minecraft:" + t.toLowerCase(Locale.ROOT));
         keys.add("minecraft:player");
         hiddenTypeKeys = hideEntities ? Set.copyOf(keys) : Set.of();
-        losTypeKeys = Set.copyOf(keys);
+        trackedTypeKeys = Set.copyOf(keys);
         lineOfSight = c.getBoolean("entities.line-of-sight.enabled", true);
         losInterval = Math.max(1, c.getInt("entities.line-of-sight.check-interval-ticks", 2));
         losMaxDistance = c.getDouble("entities.line-of-sight.max-distance", 64);
@@ -259,45 +265,37 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         p.getScheduler().runDelayed(this, t -> {
             refreshQueued.remove(id);
             nextRefreshAt.put(id, System.currentTimeMillis() + refreshCooldownMs);
-            refreshView(p);
-            resyncEntities(p);
+            refreshView(p); // entities follow on their own: the visibility pass re-checks them every few ticks
         }, () -> refreshQueued.remove(id), 2 + (wait + 49) / 50);
     }
 
-    /** Re-sends the chunks around the player, nearest first, spread over ticks. */
+    /**
+     * Re-sends the chunks the player's client holds, nearest first, spread over ticks. Each chunk goes to this
+     * player only; World#refreshChunk would re-send it to everyone nearby.
+     */
     void refreshView(Player p) {
         World world = p.getWorld();
         int r = world.getViewDistance();
         if (limitedArea) r = Math.min(r, limitedRadius);
         r = bedrock.adjustRadius(p, r);
         int cx = p.getLocation().getBlockX() >> 4, cz = p.getLocation().getBlockZ() >> 4;
+        // Empty where the server doesn't track it (Paper 1.21.4): then send everything in range; clients ignore
+        // chunks they don't hold.
+        Set<Long> sent = p.getSentChunkKeys();
         int n = 0;
         for (int ring = 0; ring <= r; ring++) {
             for (int dx = -ring; dx <= ring; dx++) {
                 for (int dz = -ring; dz <= ring; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
                     int x = cx + dx, z = cz + dz;
+                    if (!sent.isEmpty() && !sent.contains(Chunk.getChunkKey(x, z))) continue;
                     Bukkit.getRegionScheduler().runDelayed(this, world, x, z, t -> {
-                        if (world.isChunkLoaded(x, z)) world.refreshChunk(x, z);
+                        if (!p.isOnline() || !p.getWorld().equals(world)) return;
+                        if (!nms.sendChunk(p, world, x, z) && world.isChunkLoaded(x, z)) world.refreshChunk(x, z);
                     }, 1 + n++ / maxChunksPerTick);
                 }
             }
         }
-    }
-
-    /**
-     * Hides then re-shows nearby entities so the client gets fresh spawn packets, which the packet filter
-     * then lets through or drops according to the player's current state.
-     */
-    // ponytail: assumes entities within 64 blocks share the player's Folia region, schedule per entity if that bites
-    void resyncEntities(Player p) {
-        if (!hideEntities) return;
-        World world = p.getWorld();
-        List<Entity> nearby = p.getNearbyEntities(64, world.getMaxHeight() - world.getMinHeight(), 64);
-        for (Entity e : nearby) lineOfSightCuller.hideKeepingTab(p, e);
-        p.getScheduler().runDelayed(this, t -> {
-            for (Entity e : nearby) if (e.isValid() && !lineOfSightCuller.isCulled(p, e)) p.showEntity(this, e);
-        }, null, 2);
     }
 
     @EventHandler
@@ -313,7 +311,7 @@ public final class AntiFreeCam extends JavaPlugin implements Listener {
         views.remove(id);
         nextRefreshAt.remove(id);
         refreshQueued.remove(id);
-        lineOfSightCuller.forget(id);
+        entities.forget(id);
     }
 
     // Paper fires this before the destination chunks are sent, so the state is right from the first chunk.

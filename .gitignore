@@ -2,3 +2,5 @@
 build/
 .idea/
 *.iml
+e2e/.servers/
+e2e/bot/node_modules/

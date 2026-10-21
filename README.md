@@ -15,7 +15,19 @@ How it hides:
 - Ores in the band players *can* see are best covered by Paper's built-in anti-xray (`anticheat.anti-xray` in `paper-world-defaults.yml`).
 - Commands: `/afc <debug|reload|world|stats|test>`, `/afcworld <list|add|remove> [world]`, `/afcdebug`, `/afcreload`. Permission: `antifreecam.admin`.
 
-Build: `./gradlew build` → `build/libs/ProjectAntiFreeCam-<version>.jar`.
+Build: `./gradlew build` → `build/libs/ProjectAntiFreeCam-<version>.jar`. Without a local JDK, build in Docker:
+`docker run --rm -v "$PWD:/work" -w /work gradle:9.2.1-jdk21 gradle build`.
+
+## Testing
+
+`./gradlew test` runs the unit tests (chunk rewriting, light, ray tracing).
+
+`e2e/run.sh` runs the end-to-end test: it starts real Paper and Folia servers in Docker with the built plugin, connects bot
+clients and checks what they actually receive — hidden terrain, light, biomes and block entities on the wire, entities
+crossing the cut, line of sight through stone and glass, the tab list, and that refreshes go only to the player who
+needs them. It needs Docker, Node.js and curl. Pass server builds to test only those (`e2e/run.sh paper:1.21.8`), or
+`--without-plugin` for a control run in which the hiding checks should fail. On Paper 1.20.6 the bot library can't see
+pigs, so the two pig checks fail there with or without the plugin.
 
 ## Provenance
 

@@ -235,10 +235,6 @@ e2e/run.sh paper:1.21.8 folia:1.21.8       # just these
 e2e/run.sh --without-plugin paper:1.21.8   # control run: the hiding checks should fail
 ```
 
-## License and provenance
+## License
 
 MIT, see [LICENSE](LICENSE).
-
-This is a clean-room implementation. It was written only from behavior descriptions ([SPEC.md](SPEC.md),
-[SPEC-ADDENDUM.md](SPEC-ADDENDUM.md)) produced by someone else who studied earlier projects. No source code from those
-projects was used.

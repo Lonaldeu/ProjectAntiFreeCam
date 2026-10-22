@@ -2,10 +2,11 @@ package me.lonaldeu.antifreecam;
 
 /**
  * What a player may not see: everything at or below {@code maxHiddenY} (below {@code minY} for nothing), plus,
- * with {@code occlude}, the sections cave occlusion hides. {@code surface} means the player is above the
- * protection level; otherwise the cut follows the player's own depth.
+ * with {@code occlude}, the sections cave occlusion hides, and with {@code containers}, containers out of their
+ * sight. {@code surface} means the player is above the protection level; otherwise the cut follows the player's own
+ * depth.
  */
-record View(int minY, int maxHiddenY, boolean surface, boolean occlude) {
+record View(int minY, int maxHiddenY, boolean surface, boolean occlude, boolean containers) {
 
     /**
      * The highest hidden Y for a player who sees down to {@code reach}: everything in the whole sections below it.

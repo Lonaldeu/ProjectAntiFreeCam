@@ -26,8 +26,10 @@ class OcclusionTest {
         final Map<Long, long[]> columns = new HashMap<>();
         final Map<Long, Long> clientHidden = new HashMap<>(); // what the client holds as replacement
         final List<int[]> resends = new ArrayList<>(); // {x, z}
-        final List<int[]> recomputes = new ArrayList<>(); // {x, z, s, epoch}
-        final ArrayDeque<int[]> pendingResends = new ArrayDeque<>(), pendingRecomputes = new ArrayDeque<>();
+        final List<int[]> recomputes = new ArrayList<>(); // {x, z, s, epoch, slow}
+        final List<int[]> conceals = new ArrayList<>(); // {x, z}
+        final ArrayDeque<int[]> pendingResends = new ArrayDeque<>(), pendingRecomputes = new ArrayDeque<>(),
+                pendingConceals = new ArrayDeque<>();
         final Occlusion occlusion = new Occlusion(new Occlusion.Server() {
             @Override
             public void resend(int x, int z, int n) {
@@ -36,10 +38,16 @@ class OcclusionTest {
             }
 
             @Override
-            public void recompute(int x, int z, int s) {
-                int[] r = {x, z, s, occlusion.epoch()};
+            public void recompute(int x, int z, int s, boolean slow) {
+                int[] r = {x, z, s, occlusion.epoch(), slow ? 1 : 0};
                 recomputes.add(r);
                 pendingRecomputes.add(r);
+            }
+
+            @Override
+            public void conceal(int x, int z, int n) {
+                conceals.add(new int[]{x, z});
+                pendingConceals.add(new int[]{x, z});
             }
         });
 
@@ -55,10 +63,13 @@ class OcclusionTest {
             for (long key : columns.keySet()) send((int) key, (int) (key >> 32));
         }
 
-        /** Answers recomputes and delivers re-sends until none are left. */
+        /** Answers recomputes and delivers re-sends (and, once nothing else is left, conceals) until none are left. */
         void settle() {
-            while (!pendingResends.isEmpty() || !pendingRecomputes.isEmpty()) {
-                if (!pendingRecomputes.isEmpty()) {
+            while (!pendingResends.isEmpty() || !pendingRecomputes.isEmpty() || !pendingConceals.isEmpty()) {
+                if (pendingResends.isEmpty() && pendingRecomputes.isEmpty()) {
+                    int[] c = pendingConceals.poll();
+                    occlusion.concealNow(c[0], c[1]);
+                } else if (!pendingRecomputes.isEmpty()) {
                     int[] r = pendingRecomputes.poll();
                     occlusion.exact(r[0], r[1], r[2], columns.get(Occlusion.key(r[0], r[1]))[r[2]], r[3]);
                 } else {
@@ -172,8 +183,10 @@ class OcclusionTest {
         w.settle();
         w.resends.clear(); // those were columns arriving out of order
         assertEquals(1, w.hidden(2, 0) & 1);
-        w.occlusion.changed(2 * 16 + 5, 16, 5, true); // placing stone opens nothing
-        assertTrue(w.recomputes.isEmpty() && w.resends.isEmpty());
+        w.occlusion.changed(2 * 16 + 5, 16, 5, true); // placing stone opens nothing: only a slow check, for closing
+        assertTrue(w.resends.isEmpty() && w.recomputes.stream().allMatch(r -> r[4] == 1));
+        w.settle();
+        w.recomputes.clear();
 
         w.column(2, 0, STONE, OPEN_SURFACE, SKY); // the server now has a hole at the bottom of the surface section
         w.occlusion.changed(2 * 16 + 5, 16, 5, false);
@@ -237,6 +250,120 @@ class OcclusionTest {
         w.settle();
         assertEquals(0b001, w.hidden(2, 2));
         assertEquals(0b001, w.hidden(0, 0)); // the player's own column is real, not all stone
+    }
+
+    /** Sealing a hole again hides what it led to once more, a few seconds later. */
+    @Test
+    void sealingAPocketHidesItAgain() {
+        World w = flat(2);
+        w.column(2, 0, STONE, OPEN_SURFACE, SKY);
+        w.occlusion.moveTo(0, 2, 0);
+        w.sendAll();
+        w.settle();
+        assertEquals(0, w.hidden(2, 0) & 1);
+        w.recomputes.clear();
+        w.column(2, 0, STONE, SURFACE, SKY); // the hole is filled in with a solid block
+        w.occlusion.changed(2 * 16 + 5, 16, 5, true);
+        assertEquals(1, w.recomputes.size());
+        assertEquals(1, w.recomputes.get(0)[4]); // the slow way: a solid block can only close
+        w.settle();
+        assertEquals(1, w.conceals.size());
+        assertEquals(1, w.hidden(2, 0) & 1);
+    }
+
+    /** A tunnel east with a side passage south into a pocket at (10, 2), walked along to x = 20. */
+    private static World walkedPastSideCave() {
+        World w = new World();
+        w.occlusion.view(0, -1, true);
+        for (int x = -1; x <= 21; x++) {
+            w.column(x, 0, TUNNEL_X);
+            w.column(x, -1, STONE);
+            w.column(x, 1, STONE);
+        }
+        w.column(10, 0, Occlusion.pairs(W | E | S)); // a side passage south...
+        w.column(10, 1, Occlusion.pairs(N | S));
+        w.column(10, 2, Occlusion.pairs(N)); // ...into a pocket
+        w.occlusion.moveTo(0, 0, 0);
+        w.sendAll();
+        w.settle();
+        for (int x = 1; x <= 20; x++) { // walk east: the columns beside the tunnel pass through the box around the eyes
+            w.occlusion.moveTo(x, 0, 0);
+            w.settle();
+        }
+        assertEquals(0, w.hidden(10, 2) & 1);
+        assertEquals(0, w.hidden(5, -1) & 1);
+        return w;
+    }
+
+    /** Columns walked past and still held real don't count as cut off when a side cave is sealed later. */
+    @Test
+    void sealingAPocketAfterAWalkStillConcealsIt() {
+        World w = walkedPastSideCave();
+        w.column(10, 1, STONE); // the side passage is filled in
+        w.occlusion.changed(10 * 16 + 5, 5, 16 + 5, true);
+        w.settle();
+        assertEquals(1, w.hidden(10, 2) & 1);
+        assertEquals(0, w.hidden(5, -1) & 1); // walked past: left as sent
+    }
+
+    /** The same, with the seal seen first in a re-sent chunk packet. */
+    @Test
+    void sealSeenInAReSentChunkConcealsWhatItCutOff() {
+        World w = walkedPastSideCave();
+        w.column(10, 1, STONE);
+        w.send(10, 1);
+        w.settle();
+        assertEquals(1, w.conceals.size());
+        assertEquals(1, w.hidden(10, 2) & 1);
+        assertEquals(0, w.hidden(5, -1) & 1);
+    }
+
+    /** Sealed in: most of the view goes out of reach at once, and is left as it was sent. */
+    @Test
+    void sealingYourselfInConcealsNothing() {
+        World w = new World();
+        w.occlusion.view(0, -1, true);
+        for (int x = -3; x <= 3; x++)
+            for (int z = -3; z <= 3; z++) w.column(x, z, STONE, SKY, STONE);
+        w.occlusion.moveTo(0, 1, 0);
+        w.sendAll();
+        w.settle();
+        assertEquals(0, w.hidden(3, 3) & 0b010);
+        // Close the ring of columns around the eye's box, one section at a time.
+        for (int x = -2; x <= 2; x++)
+            for (int z = -2; z <= 2; z++) {
+                if (Math.max(Math.abs(x), Math.abs(z)) != 2) continue;
+                w.column(x, z, STONE, STONE, STONE);
+                w.occlusion.changed(x * 16, 16, z * 16, true);
+                w.settle();
+            }
+        // Only the ring itself is re-sent (the solid sections above and below each closed one); the 24 columns
+        // outside it, all out of reach at once when the last gap closed, stay as sent: real.
+        assertTrue(w.conceals.stream().allMatch(c -> Math.max(Math.abs(c[0]), Math.abs(c[1])) == 2));
+        assertEquals(0, w.hidden(3, 3) & 0b010);
+    }
+
+    /** A solid block placed out of reach counts as closing until the server says otherwise. */
+    @Test
+    void solidBlockOutOfReachCountsAsClosing() {
+        World w = new World();
+        w.occlusion.view(0, -1, true);
+        w.column(0, 0, TUNNEL_X);
+        w.column(1, 0, TUNNEL_X);
+        w.column(2, 0, STONE); // the tunnel is blocked here
+        w.column(3, 0, TUNNEL_X);
+        w.column(4, 0, TUNNEL_X);
+        w.occlusion.moveTo(0, 0, 0);
+        w.sendAll();
+        w.settle();
+        assertEquals(1, w.hidden(4, 0) & 1);
+        w.column(3, 0, STONE); // someone seals the far part, out of this player's reach
+        w.occlusion.changed(3 * 16 + 5, 5, 5, true);
+        w.column(2, 0, TUNNEL_X); // then the block in between is mined
+        w.occlusion.changed(2 * 16 + 5, 5, 5, false);
+        w.settle();
+        assertEquals(1, w.hidden(4, 0) & 1); // never shown through the sealed part
+        assertTrue(w.resends.stream().noneMatch(r -> r[0] == 4));
     }
 
     @Test

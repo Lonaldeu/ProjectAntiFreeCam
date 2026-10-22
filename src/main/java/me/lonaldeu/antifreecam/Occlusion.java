@@ -1,9 +1,11 @@
 package me.lonaldeu.antifreecam;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -14,23 +16,32 @@ import java.util.Set;
  * <p>
  * A section's connectivity is a 36-bit value: bit 6a+b is set when faces a and b are joined by see-through cells,
  * so bit 7a means face a has any. Faces: 0 down, 1 up, 2 north (-z), 3 south (+z), 4 west (-x), 5 east (+x); the
- * opposite of face f is f ^ 1. Connectivity comes from each chunk packet's blocks; after a see-through block
- * update the server works it out again for that section. Reach only grows until the view changes or a section the
- * player reaches turns out more closed than before. Never re-sends to hide. Not thread-safe: one per connection,
- * used on its event loop only.
+ * opposite of face f is f ^ 1. Connectivity comes from each chunk packet's blocks; after a block update the server
+ * works it out again for that section (a few seconds later for a solid block placed, which can only close). Reach
+ * grows as paths open; when one closes, the few columns that end up out of reach are re-sent hidden again. Not
+ * thread-safe: one per connection, used on its event loop only.
  */
 final class Occlusion {
 
     static final long ALL = (1L << 36) - 1;
     private static final int START = 1 << 6; // the player's own section: every face is an exit
     private static final int[] DX = {0, 0, 0, 0, -1, 1}, DZ = {0, 0, -1, 1, 0, 0};
+    // More columns than this going out of reach at once means the player sealed themselves in, not a cave sealed far
+    // away: those stay as sent, or every door closed behind them would re-send their whole view as stone.
+    private static final int MAX_CONCEAL = 16;
 
     interface Server {
         /** Re-send column (x, z) to this player; n counts re-sends in the current burst, for pacing. */
         void resend(int x, int z, int n);
 
-        /** Work out the exact connectivity of section s of column (x, z); the answer comes back through {@link #exact}. */
-        void recompute(int x, int z, int s);
+        /**
+         * Work out the exact connectivity of section s of column (x, z); the answer comes back through {@link #exact}.
+         * {@code slow}: a few seconds later, for changes that can only close (so busy redstone costs little).
+         */
+        void recompute(int x, int z, int s, boolean slow);
+
+        /** Call {@link #concealNow} for column (x, z) a few seconds from now; n counts them in this burst, for pacing. */
+        void conceal(int x, int z, int n);
     }
 
     private static final class Col {
@@ -38,8 +49,9 @@ final class Occlusion {
         long[] conn;
         byte[] entered; // per section: faces it was entered through (bits 0-5), START (bit 6)
         long sentHidden; // sections the client currently holds as replacement
+        long before; // sections visible just before a path closed, with the connectivity as it was
         long dirty; // sections changed while not entered: connectivity is worked out again once they are
-        long pending; // sections whose connectivity is being worked out
+        long pending, pendingSlow; // sections whose connectivity is being worked out (fast, slow)
         boolean resendQueued;
 
         Col(int x, int z, long[] conn) {
@@ -91,7 +103,7 @@ final class Occlusion {
         heightHidden = Math.max(0, Math.floorDiv(maxHiddenY - minY + 1, 16));
         burst = 0;
         rebuild();
-        reveal(null);
+        reveal(null, false); // a new view re-sends everything anyway
     }
 
     /** A chunk packet for column (x, z) with these section connectivities is about to be sent: the sections to replace. */
@@ -105,6 +117,7 @@ final class Occlusion {
         } else {
             // Only a section the player reaches getting more closed can shrink their reach.
             for (int s = 0; s < conn.length; s++) shrank |= (c.conn[s] & ~conn[s]) != 0 && c.entered[s] != 0;
+            if (shrank) snapshot();
             c.conn = conn;
         }
         c.resendQueued = false;
@@ -125,22 +138,34 @@ final class Occlusion {
         }
         long hidden = hidden(c);
         c.sentHidden = hidden;
-        reveal(c);
+        reveal(c, shrank);
         return hidden;
     }
 
     /**
-     * A block the client holds changed. Only a see-through block can open new paths; the server works out the
-     * section's connectivity again (at once if the player reaches it, otherwise once they do). A placed block's
-     * closing only counts from the column's next chunk packet.
+     * A block the client holds changed, and the server works out the section's connectivity again: at once for a
+     * see-through block, which can open paths, if the player reaches it; a few seconds later for a solid one, which
+     * can only close them. Out of reach, it is worked out once reached, and a section that got a solid block counts
+     * as closed until then: the connectivity known from its chunk packet may be more open than it now is.
      */
     void changed(int x, int y, int z, boolean opaque) {
         Col c = cols.get(key(x >> 4, z >> 4));
-        if (c == null || opaque) return;
+        if (c == null) return;
         int s = (y - minY) >> 4;
-        if (s < 0 || s >= Math.min(c.conn.length, 64) || c.conn[s] == ALL) return;
-        if (c.entered[s] != 0 && active) request(c, s);
-        else c.dirty |= 1L << s; // worked out once reached, or once occlusion applies to this player again
+        if (s < 0 || s >= Math.min(c.conn.length, 64)) return;
+        long bit = 1L << s;
+        if (c.entered[s] != 0 && active) {
+            if (!opaque && c.conn[s] != ALL) request(c, s);
+            else if (opaque && c.conn[s] != 0 && (c.pendingSlow & bit) == 0) {
+                c.pendingSlow |= bit;
+                server.recompute(c.x, c.z, s, true);
+            }
+        } else if (opaque) {
+            c.conn[s] = 0;
+            c.dirty |= bit;
+        } else if (c.conn[s] != ALL) {
+            c.dirty |= bit; // worked out once reached, or once occlusion applies to this player again
+        }
     }
 
     /**
@@ -152,19 +177,33 @@ final class Occlusion {
         Col c = cols.get(key(x, z));
         if (c == null || s >= Math.min(c.conn.length, 64)) return;
         c.pending &= ~(1L << s);
+        c.pendingSlow &= ~(1L << s);
         long old = c.conn[s];
         if (conn == old) return;
-        c.conn[s] = conn;
-        if (c.entered[s] == 0) return;
+        if (c.entered[s] == 0) {
+            c.conn[s] = conn;
+            return;
+        }
         burst = 0;
-        if ((old & ~conn) != 0) {
-            rebuild(); // it closed: reach may shrink (shown as hidden again from the column's next send)
+        boolean closed = (old & ~conn) != 0;
+        if (closed) snapshot();
+        c.conn[s] = conn;
+        if (closed) {
+            rebuild(); // reach may shrink
         } else {
             stack.push(new Entry(c, s));
             touched.add(c);
             drain();
         }
-        reveal(null);
+        reveal(null, closed);
+    }
+
+    /** A few seconds after a path closed: re-send column (x, z) hidden if it is still out of reach but held real. */
+    void concealNow(int x, int z) {
+        Col c = cols.get(key(x, z));
+        if (c == null || !active || c.resendQueued || (hidden(c) & ~c.sentHidden) == 0) return;
+        c.resendQueued = true;
+        server.resend(c.x, c.z, 0);
     }
 
     private void request(Col c, int s) {
@@ -172,7 +211,7 @@ final class Occlusion {
         c.dirty &= ~bit;
         if ((c.pending & bit) != 0) return;
         c.pending |= bit;
-        server.recompute(c.x, c.z, s);
+        server.recompute(c.x, c.z, s, false);
     }
 
     /** The eye's section, kept inside the column so players above or below the world still see out. */
@@ -198,7 +237,7 @@ final class Occlusion {
                 Col n = cols.get(key(x + dx, z + dz));
                 if (n != null) touched.add(n);
             }
-        reveal(null);
+        reveal(null, false);
     }
 
     void forget(long key) {
@@ -239,6 +278,15 @@ final class Occlusion {
             if (c != null) enter(c, eyeSection(c), START);
         }
         drain();
+    }
+
+    /**
+     * Before a path closes: reach from where the player is now, with the connectivity as it still is, kept as each
+     * column's {@code before}. Reach only grows between rebuilds, so it may still hold columns walked past long ago.
+     */
+    private void snapshot() {
+        rebuild();
+        for (Col c : cols.values()) c.before = visible(c);
     }
 
     private void enter(Col c, int s, int bits) {
@@ -293,13 +341,25 @@ final class Occlusion {
         return ~visible(c) & eligible;
     }
 
-    /** Re-sends touched columns (other than {@code except}) that now show a section the client holds as replacement. */
-    private void reveal(Col except) {
+    /**
+     * Re-sends touched columns (other than {@code except}) that now show a section the client holds as replacement.
+     * After a path closed ({@code conceal}), also those where it cut off a section the client holds real, a few
+     * seconds later, unless there are too many of them.
+     */
+    private void reveal(Col except, boolean conceal) {
+        List<Col> concealed = new ArrayList<>();
         for (Col c : touched) {
-            if (c == except || !active || c.resendQueued || (visible(c) & c.sentHidden) == 0) continue;
-            c.resendQueued = true;
-            server.resend(c.x, c.z, burst++);
+            if (c == except || !active || c.resendQueued) continue;
+            if ((visible(c) & c.sentHidden) != 0) {
+                c.resendQueued = true;
+                server.resend(c.x, c.z, burst++);
+            } else if (conceal && (hidden(c) & ~c.sentHidden & c.before) != 0) {
+                concealed.add(c);
+            }
         }
         touched.clear();
+        if (concealed.size() > MAX_CONCEAL) return;
+        int n = 0;
+        for (Col c : concealed) server.conceal(c.x, c.z, n++);
     }
 }

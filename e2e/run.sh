@@ -37,8 +37,22 @@ for target in "$@"; do
     url=$(curl -s "https://fill.papermc.io/v3/projects/$project/versions/$version/builds/latest" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
     curl -sf -o "$dir/server.jar" "$url" || { echo "Could not download $target"; failed=1; continue; }
   fi
-  # A fresh world and default config every run.
+  # A fresh world and config every run: the defaults, but with air for hidden blocks (the test tells them apart from
+  # the world's stone by name) and the Nether protected with settings of its own.
   rm -rf "$dir"/plugins/*.jar "$dir/plugins/ProjectAntiFreeCam" "$dir/world" "$dir/world_nether" "$dir/world_the_end"
+  mkdir -p "$dir/plugins/ProjectAntiFreeCam"
+  cat > "$dir/plugins/ProjectAntiFreeCam/config.yml" <<'EOF'
+worlds:
+  whitelist: [world, world_nether]
+  overrides:
+    world_nether:
+      antixray:
+        protection-y-level: 64.0
+        hide-below-y: 40
+performance:
+  replacement:
+    block-type: air
+EOF
   [ -z "$jar" ] || cp "$jar" "$dir/plugins/"
   cp "$testplugin" "$dir/plugins/"
   cp server.properties "$dir/"
@@ -53,13 +67,21 @@ for target in "$@"; do
   for _ in $(seq 1 120); do docker logs afc-e2e 2>&1 | grep -q 'Done (' && break; sleep 3; done
 
   echo "===== $target"
-  (cd bot && MC_VERSION=$version PORT=25566 timeout 240 node test.js) || failed=1
+  (cd bot && MC_PROJECT=$project MC_VERSION=$version PORT=25566 timeout 360 node test.js) || failed=1
   docker logs afc-e2e > "$dir/server.log" 2>&1
   grep -E 'Exception|SEVERE' "$dir/server.log" | head -5
   # The plugin logs these when something goes out unfiltered ("... on this version: " when a feature is off); no bot
   # check might notice.
-  if [ -n "$jar" ] && grep -qE 'Self-check FAILED|Could not filter|Unrecognized chunk format|on this version: ' "$dir/server.log"; then
+  if [ -n "$jar" ] && grep -qE 'Self-check FAILED|Could not filter|Could not take hidden light|Unrecognized chunk format|on this version: ' "$dir/server.log"; then
     echo "FAIL $target: the plugin sent packets unfiltered (see $dir/server.log)"
+    failed=1
+  fi
+  if [ -n "$jar" ] && ! grep -q "Paper's anti-xray is off" "$dir/server.log"; then
+    echo "FAIL $target: no hint that Paper's anti-xray is off"
+    failed=1
+  fi
+  if [ -n "$jar" ] && ! grep -q "placed from the world seed" "$dir/server.log"; then
+    echo "FAIL $target: no warning that ores are placed from the world seed"
     failed=1
   fi
   docker rm -f afc-e2e >/dev/null

@@ -147,7 +147,7 @@ final class Commands implements TabExecutor {
                 String hidden = view == null ? "nothing" : (view.maxHiddenY() < view.minY() ? "nothing below"
                         : "Y <= " + view.maxHiddenY() + (view.surface() ? " (above ground)" : " (depth limit)"))
                         + (view.occlude() ? ", plus unreachable caves" : "");
-                send(s, String.format("§7Your Y: §f%.1f §7| protection Y: §f%.1f §7| hidden: §f%s", p.getY(), plugin.protectionY, hidden));
+                send(s, String.format("§7Your Y: §f%.1f §7| protection Y: §f%.1f §7| hidden: §f%s", p.getY(), plugin.settings(p.getWorld()).protectionY(), hidden));
             }
             case "refresh" -> {
                 if (!plugin.worlds.contains(p.getWorld().getName())) {

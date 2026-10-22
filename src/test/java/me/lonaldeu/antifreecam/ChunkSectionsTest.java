@@ -245,6 +245,31 @@ class ChunkSectionsTest {
         return arrays;
     }
 
+    /** Single blocks changed (a container disguised): only they and the block count change, biomes stay. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void changesSingleBlocks(boolean prefixed) {
+        int[] blocks = new int[4096];
+        for (int i = 0; i < blocks.length; i++) blocks[i] = i % 3 == 0 ? AIR : STONE;
+        blocks[100] = 150; // the container
+        byte[] first = section(blocks, prefixed), second = section(blocks, prefixed, 9);
+        ByteArrayOutputStream chunk = new ByteArrayOutputStream();
+        chunk.writeBytes(first);
+        chunk.writeBytes(second);
+
+        byte[] out = ChunkSections.withBlocks(chunk.toByteArray(), java.util.Map.of(1, java.util.Map.of(100, AIR)), IS_AIR, GLOBAL_BITS);
+        ByteBuffer r = ByteBuffer.wrap(out);
+        byte[] kept = new byte[first.length];
+        r.get(kept);
+        assertArrayEquals(first, kept);
+        int[] expected = blocks.clone();
+        expected[100] = AIR;
+        assertEquals((int) Arrays.stream(expected).filter(id -> id != AIR).count(), r.getShort());
+        assertArrayEquals(expected, ChunkSections.readContainer(r, 4096, 8, prefixed));
+        assertEquals(9, ChunkSections.readContainer(r, 64, 3, prefixed)[0]);
+        assertEquals(0, r.remaining());
+    }
+
     private static byte[] section(int[] blocks, boolean prefixed) {
         return section(blocks, prefixed, 7);
     }

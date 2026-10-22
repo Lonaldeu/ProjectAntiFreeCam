@@ -4,8 +4,12 @@ import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.entity.AbstractArrow;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.Firework;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.Projectile;
+import org.bukkit.entity.TextDisplay;
 import org.bukkit.util.BoundingBox;
 import org.bukkit.util.Vector;
 
@@ -52,9 +56,13 @@ final class EntityVisibility {
         final Map<UUID, Long> keepInTab = new ConcurrentHashMap<>(); // player -> until when to keep in the tab list
         final Set<UUID> listed = ConcurrentHashMap.newKeySet(); // players we hid but kept in the tab list
         final Set<UUID> unlisted = ConcurrentHashMap.newKeySet(); // players we hid and took off it: another plugin hides them too
+        final Map<Integer, UUID> held = new ConcurrentHashMap<>(); // per-player entities kept off this client, by entity id
         final Map<UUID, Sight> sight = new HashMap<>(); // viewer's own thread only
         volatile int[] hiddenIds = new int[0]; // read by netty threads
         volatile double[] positions = new double[0]; // x, y, z, hidden (1 or 0) per nearby entity; read by netty threads
+        volatile Set<Integer> onServer = Set.of(); // ids of listed entities the last check found on the server; netty reads
+        volatile Set<Integer> farOnServer = Set.of(); // the same from the last far pass, beyond the near box
+        final Set<Integer> shownShots = ConcurrentHashMap.newKeySet(); // projectiles of hidden owners found in sight
         Vector lastEye;
         int check, tick;
     }
@@ -90,6 +98,41 @@ final class EntityVisibility {
                 if (plugin.debug) plugin.getLogger().warning("Entity visibility check failed for " + player.getName() + ": " + e);
             }
         }, null, 1, 1);
+    }
+
+    /** Whether {@code entity} (an entity id) is held back from {@code viewer}'s client. Netty-thread safe. */
+    boolean isHeld(UUID viewer, int entity) {
+        Viewer v = viewers.get(viewer);
+        return v != null && v.held.containsKey(entity);
+    }
+
+    /**
+     * Whether the last check found {@code entity} (an entity id) on the server near {@code viewer}: not one that exists
+     * only in another plugin's packets, which can't be sent again once taken off a client. Netty-thread safe.
+     */
+    boolean onServer(UUID viewer, int entity) {
+        Viewer v = viewers.get(viewer);
+        return v != null && (v.onServer.contains(entity) || v.farOnServer.contains(entity));
+    }
+
+    /** Whether {@code entity} (an entity id, 0 for none) was hidden from {@code viewer} by the last check. Netty-thread safe. */
+    boolean hides(UUID viewer, int entity) {
+        Viewer v = viewers.get(viewer);
+        if (v == null || entity == 0) return false;
+        for (int hidden : v.hiddenIds) if (hidden == entity) return true;
+        return false;
+    }
+
+    /** Whether the last check found {@code entity}, a projectile of a hidden owner, in {@code viewer}'s sight. Netty-thread safe. */
+    boolean showsShot(UUID viewer, int entity) {
+        Viewer v = viewers.get(viewer);
+        return v != null && v.shownShots.contains(entity);
+    }
+
+    /** Whether anything is held back from {@code viewer}'s client. Netty-thread safe. */
+    boolean holdsAny(UUID viewer) {
+        Viewer v = viewers.get(viewer);
+        return v != null && !v.held.isEmpty();
     }
 
     /** Called from netty threads when the packet filter drops an entity's spawn for {@code viewer}. */
@@ -141,6 +184,7 @@ final class EntityVisibility {
         viewers.forEach((viewerId, v) -> {
             v.hidden.remove(player);
             v.droppedSpawns.remove(player);
+            v.held.values().removeIf(player::equals);
             v.unlisted.remove(player);
             if (!v.listed.remove(player)) return;
             v.keepInTab.remove(player);
@@ -168,7 +212,9 @@ final class EntityVisibility {
                 } catch (RuntimeException ignored) { // e.g. an entity of another Folia region at shutdown
                 }
             }
-            for (UUID id : v.droppedSpawns) { // still paired by the server, but the client never got their spawn
+            Set<UUID> unsent = new HashSet<>(v.droppedSpawns);
+            unsent.addAll(v.held.values());
+            for (UUID id : unsent) { // still paired by the server, but the client never got their spawn
                 try {
                     Entity e = Bukkit.getEntity(id);
                     if (e != null) nms.resendEntity(p, e);
@@ -185,12 +231,20 @@ final class EntityVisibility {
         View view = plugin.views.get(player.getUniqueId());
         boolean depth = plugin.hideEntities && view != null;
         boolean heightHidden = depth && view.maxHiddenY() >= view.minY();
-        boolean sightRule = plugin.lineOfSight && plugin.worlds.contains(world.getName())
+        boolean sightRule = plugin.worlds.contains(world.getName()) && plugin.settings(world).lineOfSight()
                 && player.getGameMode() != GameMode.SPECTATOR && !player.hasPermission("antifreecam.bypass");
         Vector eye = player.getEyeLocation().toVector();
         Map<Long, Boolean> blocks = new HashMap<>(); // rays to nearby entities cross the same blocks: look each up once
         Raycast.Solid solid = (x, y, z) -> blocks.computeIfAbsent(blockKey(x, y, z), k -> world.getType(x, y, z).isOccluding());
-        Vector predicted = sightRule ? predictEye(player, v, solid, eye) : null;
+        Containers containers = view != null && view.containers() ? plugin.containersOf(player.getUniqueId()) : null;
+        Vector predicted = sightRule || containers != null ? predictEye(player, v, solid, eye) : null;
+        if (containers != null) {
+            try { // before the entities, which may fail near a Folia region border
+                containers.check(player, check, eye, predicted);
+            } catch (RuntimeException e) {
+                if (plugin.debug) plugin.getLogger().warning("Container check failed for " + player.getName() + ": " + e);
+            }
+        }
         long eyeBlock = blockKey(eye.getBlockX(), eye.getBlockY(), eye.getBlockZ());
         Entity vehicle = player.getVehicle();
         List<Entity> passengers = player.getPassengers();
@@ -200,44 +254,94 @@ final class EntityVisibility {
         double h = heightHidden ? world.getMaxHeight() - world.getMinHeight() : r;
         Set<UUID> seen = new HashSet<>();
         List<Integer> hiddenIds = new ArrayList<>();
+        int nearApiHidden = 0, nearHeld = 0;
+        Set<Integer> onServer = new HashSet<>();
         List<Location> nearbyAt = new ArrayList<>();
         List<Boolean> nearbyHidden = new ArrayList<>();
         for (Entity e : player.getNearbyEntities(r, h, r)) {
-            if (!plugin.trackedTypes.contains(e.getType())) continue;
             UUID id = e.getUniqueId();
-            seen.add(id);
-            Location at = e.getLocation();
-            boolean hide = depth && at.getY() <= view.maxHiddenY();
-            if (!e.isVisibleByDefault()) {
-                depthOnly(player, v, e, hide);
+            int entityId = e.getEntityId();
+            boolean listed = plugin.trackedTypes.contains(e.getType());
+            // A type taken off the lists by a reload: what is still marked is let go once.
+            if (!listed && !v.hidden.contains(id) && !v.held.containsKey(entityId) && !v.droppedSpawns.contains(id))
                 continue;
-            }
-            boolean spawnWasDropped = v.droppedSpawns.remove(id);
-            if (hide) v.sight.remove(id); // out of the picture: start fresh when it comes back above the cut
-            else if (sightRule && Math.abs(at.getY() - eye.getY()) <= r && !exempt(e, vehicle, passengers)) {
-                Sight s = v.sight.computeIfAbsent(id, k -> new Sight());
-                long entityBlock = blockKey(at.getBlockX(), at.getBlockY(), at.getBlockZ());
-                boolean far = at.toVector().distanceSquared(eye) > FAR * FAR;
-                int maxAge = s.clear ? (far ? 2 * REUSE_CHECKS : REUSE_CHECKS) : (far ? 2 : 1);
-                if (s.computedAt == 0 || s.viewerBlock != eyeBlock || s.entityBlock != entityBlock || check - s.computedAt >= maxAge) {
-                    BoundingBox box = e.getBoundingBox();
-                    s.clear = canSee(solid, eye, box) || (predicted != null && canSee(solid, predicted, box));
-                    s.viewerBlock = eyeBlock;
-                    s.entityBlock = entityBlock;
-                    s.computedAt = check;
+            boolean wasDropped = false;
+            UUID heldAs = null;
+            try {
+                boolean perPlayer = !e.isVisibleByDefault();
+                if (perPlayer && !holdable(player, e)) {
+                    v.held.remove(entityId);
+                    continue;
                 }
-                if (s.clear) {
-                    s.wasInSight = true;
-                    s.checksOutOfSight = 0;
-                } else {
-                    s.checksOutOfSight++;
-                    hide = !s.wasInSight || s.checksOutOfSight >= HIDE_AFTER_CHECKS;
+                if (listed) onServer.add(entityId); // one this plugin can send again
+                boolean losType = plugin.losTypes.contains(e.getType());
+                // A projectile of a hidden owner gives the owner away unless it is in sight itself (an arrow flying
+                // over the wall at the viewer): so it is checked like the listed types.
+                boolean shot = plugin.projectileTypes.contains(e.getType()) && ownerHidden(v, e);
+                // One stuck in a block no longer points at its owner: shown, without the rays.
+                boolean landed = shot && e instanceof AbstractArrow arrow && arrow.isInBlock();
+                boolean shotOfHidden = shot && !landed;
+                if (shotOfHidden) losType = true;
+                Location at = e.getLocation();
+                boolean hide = listed && depth && depthY(e) <= view.maxHiddenY();
+                // Depth-only types (items, XP orbs) above the cut need nothing unless one is to be shown again:
+                // skipping them keeps item farms cheap.
+                if (!losType && !hide && !v.hidden.contains(id) && !v.droppedSpawns.contains(id)
+                        && !v.held.containsKey(entityId)) continue;
+                seen.add(id);
+                // Held while per-player: no longer, so its spawn was dropped all the same.
+                if (!perPlayer) {
+                    wasDropped = v.droppedSpawns.remove(id);
+                    heldAs = v.held.remove(entityId);
                 }
+                if (hide) v.sight.remove(id); // out of the picture: start fresh when it comes back above the cut
+                else if (losType && sightRule && Math.abs(at.getY() - eye.getY()) <= r && !exempt(e, vehicle, passengers)) {
+                    Sight s = v.sight.computeIfAbsent(id, k -> new Sight());
+                    long entityBlock = blockKey(at.getBlockX(), at.getBlockY(), at.getBlockZ());
+                    boolean far = at.toVector().distanceSquared(eye) > FAR * FAR;
+                    int maxAge = s.clear ? (far ? 2 * REUSE_CHECKS : REUSE_CHECKS) : (far ? 2 : 1);
+                    if (s.computedAt == 0 || s.viewerBlock != eyeBlock || s.entityBlock != entityBlock || check - s.computedAt >= maxAge) {
+                        BoundingBox box = e.getBoundingBox();
+                        s.clear = canSee(solid, eye, box) || (predicted != null && canSee(solid, predicted, box));
+                        s.viewerBlock = eyeBlock;
+                        s.entityBlock = entityBlock;
+                        s.computedAt = check;
+                    }
+                    if (s.clear) {
+                        s.wasInSight = true;
+                        s.checksOutOfSight = 0;
+                    } else {
+                        s.checksOutOfSight++;
+                        hide = !s.wasInSight || s.checksOutOfSight >= HIDE_AFTER_CHECKS;
+                    }
+                }
+                // Before showing it: the packet filter holds back such a projectile's spawn otherwise.
+                if ((shotOfHidden || landed) && !hide) v.shownShots.add(entityId);
+                else v.shownShots.remove(entityId);
+                if (losType) { // sounds give away mobs and players; items and boats make none of their own
+                    nearbyAt.add(at);
+                    nearbyHidden.add(hide);
+                }
+                if (perPlayer) hold(player, v, e, hide);
+                else apply(player, v, e, hide, wasDropped || heldAs != null);
+                if (hide) { // after the call: one that failed is counted in the catch instead
+                    hiddenIds.add(entityId);
+                    if (perPlayer) nearHeld++;
+                    else nearApiHidden++;
+                }
+            } catch (RuntimeException ex) {
+                // E.g. Folia: an entity, or a block a ray crosses, of another region (by a region border). This one
+                // keeps its state until a check can reach it; the others go on.
+                if (wasDropped) v.droppedSpawns.add(id);
+                if (heldAs != null) v.held.put(entityId, heldAs);
+                seen.add(id);
+                if (v.hidden.contains(id) || v.held.containsKey(entityId)) {
+                    hiddenIds.add(entityId);
+                    if (v.hidden.contains(id)) nearApiHidden++;
+                    else nearHeld++;
+                }
+                if (plugin.debug) plugin.getLogger().warning("Could not check an entity for " + player.getName() + ": " + ex);
             }
-            nearbyAt.add(at);
-            nearbyHidden.add(hide);
-            if (hide) hiddenIds.add(e.getEntityId());
-            apply(player, v, e, hide, spawnWasDropped);
         }
         v.sight.keySet().retainAll(seen);
 
@@ -253,7 +357,7 @@ final class EntityVisibility {
 
         if (check % FAR_EVERY == 0) {
             // Also without a hidden range, as long as something out there may still be hidden: to show it again.
-            if (heightHidden || v.hidden.size() > hiddenIds.size())
+            if (heightHidden || v.hidden.size() > nearApiHidden || v.held.size() > nearHeld)
                 farPass(player, v, world, heightHidden ? view.maxHiddenY() : Integer.MIN_VALUE, seen);
             // Entities that left range stay marked until seen again: the server keeps hiding them too. Only the gone
             // ones are dropped, as the server forgets those. shortcut: rescans while over 1024 live ones are hidden
@@ -265,6 +369,8 @@ final class EntityVisibility {
                 }
             }
         }
+        v.onServer = onServer;
+        v.shownShots.retainAll(onServer);
         settleDroppedSpawns(player, v, world, depth ? view : null, seen);
         for (UUID id : v.listed) syncTab(player, v, id);
         for (UUID id : v.unlisted) syncTab(player, v, id);
@@ -278,19 +384,42 @@ final class EntityVisibility {
     private void farPass(Player player, Viewer v, World world, int cut, Set<UUID> seen) {
         double far = Math.max(world.getViewDistance(), player.getSendViewDistance()) * 16;
         if (far <= plugin.losMaxDistance) return;
+        Set<Integer> onServer = new HashSet<>();
         try {
             for (Entity e : player.getNearbyEntities(far, world.getMaxHeight() - world.getMinHeight(), far)) {
                 UUID id = e.getUniqueId();
-                if (!plugin.trackedTypes.contains(e.getType()) || !seen.add(id)) continue;
-                boolean hide = e.getLocation().getY() <= cut;
-                if (!e.isVisibleByDefault()) depthOnly(player, v, e, hide);
-                // Most types aren't sent this far at all: only hide what the server sends this player.
-                else if (!hide || v.hidden.contains(id) || v.droppedSpawns.contains(id) || e.getTrackedBy().contains(player))
-                    apply(player, v, e, hide, v.droppedSpawns.remove(id));
+                if (!plugin.trackedTypes.contains(e.getType())) continue;
+                boolean wasDropped = false;
+                UUID heldAs = null;
+                try {
+                    if (e.isVisibleByDefault() || holdable(player, e)) onServer.add(e.getEntityId()); // can be sent again
+                    if (!seen.add(id)) continue;
+                    // (A landed one too: shown only once in the near box, where its spawn may then go out.)
+                    boolean hide = depthY(e) <= cut || plugin.projectileTypes.contains(e.getType()) && ownerHidden(v, e);
+                    // Items and XP orbs (sent out to spigot's misc tracking range) above the cut need nothing unless one
+                    // is to be shown again.
+                    if (!plugin.losTypes.contains(e.getType()) && !hide && !v.hidden.contains(id) && !v.droppedSpawns.contains(id)
+                            && !v.held.containsKey(e.getEntityId())) continue;
+                    if (!e.isVisibleByDefault()) {
+                        if (holdable(player, e)) hold(player, v, e, hide);
+                    }
+                    // Most types aren't sent this far at all: only hide what the server sends this player.
+                    else if (!hide || v.hidden.contains(id) || v.droppedSpawns.contains(id) || e.getTrackedBy().contains(player)) {
+                        wasDropped = v.droppedSpawns.remove(id);
+                        heldAs = v.held.remove(e.getEntityId());
+                        apply(player, v, e, hide, wasDropped || heldAs != null);
+                    }
+                } catch (RuntimeException ex) { // e.g. one of another Folia region: it keeps its state, the others go on
+                    if (wasDropped) v.droppedSpawns.add(id);
+                    if (heldAs != null) v.held.put(e.getEntityId(), heldAs);
+                    if (plugin.debug) plugin.getLogger().warning("Could not check a far entity for " + player.getName() + ": " + ex);
+                }
             }
-        } catch (RuntimeException e) { // e.g. entities of another Folia region: the next far pass tries again
+        } catch (RuntimeException e) { // e.g. Folia refusing the lookup itself: the next far pass tries again
             if (plugin.debug) plugin.getLogger().warning("Far entity check failed for " + player.getName() + ": " + e);
+            return;
         }
+        v.farOnServer = onServer;
     }
 
     /**
@@ -307,10 +436,10 @@ final class EntityVisibility {
                     v.droppedSpawns.remove(id);
                     continue;
                 }
-                boolean hide = view != null && e.getLocation().getY() <= view.maxHiddenY();
+                boolean hide = view != null && plugin.trackedTypes.contains(e.getType()) && depthY(e) <= view.maxHiddenY();
                 if (!e.isVisibleByDefault()) {
-                    depthOnly(player, v, e, hide);
-                    if (!hide) v.droppedSpawns.remove(id); // sent again, or not possible on this version
+                    if (holdable(player, e)) hold(player, v, e, hide); // takes it out of droppedSpawns
+                    else v.droppedSpawns.remove(id);
                 } else {
                     v.droppedSpawns.remove(id);
                     apply(player, v, e, hide, true);
@@ -320,6 +449,31 @@ final class EntityVisibility {
             }
         }
         if (v.droppedSpawns.size() > 1024) v.droppedSpawns.clear(); // only if settling keeps failing
+        if (v.held.size() > 1024) { // entities that left without being seen again: only the gone ones are dropped
+            try {
+                v.held.values().removeIf(id -> !seen.contains(id) && Bukkit.getEntity(id) == null);
+            } catch (RuntimeException e) { // e.g. Folia refusing a lookup from this thread: try again next time
+                if (plugin.debug) plugin.getLogger().warning("Could not prune held entities for " + player.getName() + ": " + e);
+            }
+        }
+    }
+
+    /**
+     * The height that decides whether an entity is in the hidden range: a rider's vehicle's, where that is lower, as
+     * the packet filter takes riders off with their vehicle (riders get no moves of their own).
+     */
+    private static double depthY(Entity e) {
+        double y = e.getLocation().getY();
+        for (Entity vehicle = e.getVehicle(); vehicle != null; vehicle = vehicle.getVehicle())
+            y = Math.min(y, vehicle.getLocation().getY());
+        return y;
+    }
+
+    /** Whether whoever shot or threw a projectile, or flies with a firework, is hidden from this viewer. */
+    private static boolean ownerHidden(Viewer v, Entity e) {
+        Entity owner = e instanceof Firework f && f.getAttachedTo() != null ? f.getAttachedTo()
+                : e instanceof Projectile p && p.getShooter() instanceof Entity shooter ? shooter : null;
+        return owner != null && (v.hidden.contains(owner.getUniqueId()) || v.held.containsKey(owner.getEntityId()));
     }
 
     /** Makes what the server sends this viewer match {@code hide}; a dropped spawn is sent again once it may be seen. */
@@ -342,17 +496,25 @@ final class EntityVisibility {
     }
 
     /**
-     * An entity another plugin shows to some players only. Hiding it through the server would change who sees it,
-     * so line of sight leaves it alone, but the hidden range applies: the packet filter holds back its spawn and every
-     * update about it, one already on the client is taken off it through the server's entity tracker, and it is sent
-     * again once it may be seen. droppedSpawns holds it meanwhile.
+     * Whether a per-player entity (one another plugin shows to some players only) can be held back from this viewer:
+     * only one that plugin shows them, and only through the server's entity tracker.
      */
-    private void depthOnly(Player player, Viewer v, Entity e, boolean hide) {
-        UUID id = e.getUniqueId();
+    private boolean holdable(Player player, Entity e) {
+        return player.canSee(e) && plugin.nms.tracksEntities();
+    }
+
+    /**
+     * A per-player entity: hiding it through the server would change who sees it, so it is held back from this client
+     * instead. The packet filter drops its spawn and every update about it while it is held; one already on the
+     * client is taken off it through the server's entity tracker, and it is sent again once it may be seen.
+     */
+    private void hold(Player player, Viewer v, Entity e, boolean hide) {
+        int entity = e.getEntityId();
+        boolean dropped = v.droppedSpawns.remove(e.getUniqueId());
         if (hide) {
-            if (!v.droppedSpawns.contains(id) && player.canSee(e) && plugin.nms.untrackEntity(player, e)) v.droppedSpawns.add(id);
-        } else if (v.droppedSpawns.contains(id) && plugin.nms.resendEntity(player, e)) {
-            v.droppedSpawns.remove(id);
+            if (v.held.put(entity, e.getUniqueId()) == null && !dropped) plugin.nms.untrackEntity(player, e);
+        } else if (v.held.remove(entity) != null | dropped) {
+            plugin.nms.resendEntity(player, e);
         }
     }
 
@@ -393,8 +555,9 @@ final class EntityVisibility {
         return ((long) x & 0x3FFFFFF) << 38 | ((long) z & 0x3FFFFFF) << 12 | (y & 0xFFF);
     }
 
+    /** Never hidden for line of sight: drawn through walls anyway (glowing, see-through text), or part of the viewer's ride. */
     private static boolean exempt(Entity e, Entity vehicle, List<Entity> passengers) {
-        return e.isGlowing() || e.equals(vehicle) || passengers.contains(e);
+        return e.isGlowing() || e instanceof TextDisplay t && t.isSeeThrough() || e.equals(vehicle) || passengers.contains(e);
     }
 
     /** Hides {@code e}; a player stays in the tab list when the hide makes the server take them off it. */

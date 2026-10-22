@@ -126,6 +126,64 @@ final class ChunkSections {
         return sections;
     }
 
+    /**
+     * Chunk section data with some blocks changed ({@code changes}: section, then index y << 8 | z << 4 | x, to state
+     * id), or null when it can't be parsed. Biomes and the other sections are kept as they are.
+     */
+    static byte[] withBlocks(byte[] in, Map<Integer, Map<Integer, Integer>> changes, IntPredicate isAir, int globalBits) {
+        for (boolean prefixed : layouts()) {
+            List<int[]> sections;
+            try {
+                sections = sections(in, prefixed);
+            } catch (RuntimeException wrongLayout) {
+                continue;
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream(in.length);
+            for (int i = 0; i < sections.size(); i++) {
+                int[] s = sections.get(i);
+                Map<Integer, Integer> change = changes.get(i);
+                if (change == null) {
+                    out.write(in, s[0], s[3] - s[0]);
+                    continue;
+                }
+                int[] blocks = readContainer(ByteBuffer.wrap(in, s[1], s[2] - s[1]), BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
+                change.forEach((index, state) -> blocks[index] = state);
+                int nonAir = 0;
+                for (int id : blocks) if (!isAir.test(id)) nonAir++;
+                writeCounts(out, nonAir, in, s);
+                writeBlocks(out, blocks, globalBits, prefixed);
+                out.write(in, s[2], s[3] - s[2]);
+            }
+            return out.toByteArray();
+        }
+        return null;
+    }
+
+    /** How many sections chunk section data has, and their block state ids, decoded when first asked for. */
+    record States(int count, LightLeak.Blocks blocks) {
+    }
+
+    /** The block states of chunk section data, or null when it can't be parsed. */
+    static States states(byte[] in) {
+        for (boolean prefixed : layouts()) {
+            List<int[]> sections;
+            try {
+                sections = sections(in, prefixed);
+            } catch (RuntimeException wrongLayout) {
+                continue;
+            }
+            int[][] decoded = new int[sections.size()][];
+            return new States(sections.size(), (section, index) -> {
+                if (decoded[section] == null) {
+                    int[] s = sections.get(section);
+                    decoded[section] = readContainer(ByteBuffer.wrap(in, s[1], s[2] - s[1]), BLOCKS, MAX_INDIRECT_BLOCK_BITS, prefixed);
+                }
+                return decoded[section][index];
+            });
+        }
+        return null;
+    }
+
     private static final ThreadLocal<boolean[]> OPEN = ThreadLocal.withInitial(() -> new boolean[BLOCKS]);
     private static final ThreadLocal<boolean[]> SEEN = ThreadLocal.withInitial(() -> new boolean[BLOCKS]);
     private static final ThreadLocal<int[]> STACK = ThreadLocal.withInitial(() -> new int[BLOCKS]);

@@ -11,6 +11,33 @@ worlds:
   whitelist:
     - world
     - mining_world
+  # Settings that differ in one world, under its name and the same keys as below; anything left out
+  # comes from the main settings. These can be set per world: antixray.protection-y-level,
+  # hide-below-y, hysteresis, underground-view-depth and cave-occlusion,
+  # performance.underground-protection.enabled, containers.enabled and
+  # entities.line-of-sight.enabled. The world must be in the whitelist too. For example, to hide
+  # the Nether's ancient debris (most of it at Y 8-22) from players on or above the lava sea, add
+  # world_nether to the whitelist and the lines below. underground-view-depth counts down from
+  # the player, so the Nether needs its own: 48 hides nothing there. Debris next to caves players
+  # can reach is left to Paper's anti-xray.
+  #   world_nether:
+  #     antixray:
+  #       protection-y-level: 32.0
+  #       hide-below-y: 24
+  #       underground-view-depth: 8
+  overrides: {}
+
+seed-protection:
+  # Seed-cracking mods work the world seed out from the terrain and then compute where ores, caves
+  # and structures are, which gets around block hiding.
+  # Send players a made-up hashed seed: the real one makes cracking much faster. The client only
+  # uses it to blend biome colours at their edges, which then differ a little.
+  hide-hashed-seed: true
+  # Warn at startup about protected worlds where Paper places ores from the world seed
+  # (feature-seeds.generate-random-seeds-for-all off in config/paper-world-defaults.yml): there a
+  # cracked seed gives away diamonds, gold, redstone, lapis, emeralds and debris. (The big iron and
+  # copper veins, caves and structures follow the seed either way.)
+  check-feature-seeds: true
 
 antixray:
   # Players at or above this Y count as "above ground".
@@ -44,8 +71,9 @@ entities:
     always-visible-distance: 3
     # Entities farther than this aren't checked for line of sight (the hidden range still applies).
     max-distance: 64
-  # Entity types that get hidden (types this server version doesn't have are skipped). Players
-  # always are. An empty list hides players only.
+  # Entity types hidden while underground and from anyone who can't see them (types this server
+  # version doesn't have are skipped; SKELETON also means every *_SKELETON, such as WITHER_SKELETON).
+  # Players always are. An empty list hides players only.
   hidden-types:
     - ARMOR_STAND
     - ITEM_FRAME
@@ -130,6 +158,60 @@ entities:
     - TEXT_DISPLAY
     - ITEM_DISPLAY
     - BLOCK_DISPLAY
+    - BOAT
+    - RAFT
+    - HAPPY_GHAST
+    - NAUTILUS
+  # Projectiles: hidden below the hidden level too, and, while whoever shot or threw them is hidden,
+  # unless the projectile itself is in sight (an arrow flying over the wall at the player shows) or
+  # has landed (an arrow stuck in a wall no longer points at its owner). So an arrow, ender pearl
+  # or the firework of an elytra flyer doesn't give away a player behind a wall. Names as above
+  # ("ARROW" also covers SPECTRAL_ARROW, "POTION" every potion).
+  projectiles:
+    enabled: true
+    types:
+      - ARROW
+      - TRIDENT
+      - ENDER_PEARL
+      - FIREWORK_ROCKET
+      - FISHING_BOBBER
+      - SNOWBALL
+      - EGG
+      - POTION
+      - EXPERIENCE_BOTTLE
+      - WIND_CHARGE
+  # Entity types hidden only while underground, without a line-of-sight check (cheap, so item
+  # farms don't cost much).
+  depth-only-types:
+    - ITEM
+    - EXPERIENCE_ORB
+
+containers:
+  # Chest and base ESP hiding: in caves and bases a player is sent for real, containers and the
+  # blocks base finders look for that they can't see are disguised as what surrounds them (air,
+  # stone or water) until they come into sight, so ESP and x-ray find nothing through walls. Within
+  # 6 blocks they are always real. Spectators and antifreecam.bypass holders skip it.
+  enabled: true
+  # Block ids; a leading * matches the end of the id (*shulker_box: every color; *chest: chests,
+  # trapped and copper ones; *sign: standing, wall and hanging signs). Only blocks with block data
+  # (a block entity) can be hidden; ones that give off light (ender chests, enchanting tables,
+  # furnaces while lit) are skipped. Hoppers, droppers and dispensers can be added, at some cost
+  # near big farms.
+  hidden-blocks:
+    # storage
+    - "*chest"
+    - barrel
+    - "*shulker_box"
+    - spawner
+    # what base finders look for
+    - "*bed"
+    - "*sign"
+    - "*banner"
+    - lectern
+  # How far away a disguised block can be shown when it comes into sight; farther ones keep their
+  # disguise until the player is closer. Chests, shulker boxes, beds, signs and banners aren't drawn
+  # past 64 blocks anyway; barrels, spawners and lecterns farther away look like their disguise.
+  max-distance: 64
 
 performance:
   # Master switch for hiding.
@@ -139,7 +221,10 @@ performance:
   # itself sends about 4).
   max-chunks-per-tick: 8
   replacement:
-    # What hidden blocks look like, e.g. air, stone, deepslate.
+    # What hidden blocks look like, e.g. air, stone, deepslate. With air, light from a torch just
+    # above the hidden level can spread through it on the client and light caves next to it. A solid
+    # block avoids that, but is a floor: a player falling past the protection level can land on it
+    # before their view changes, and take fall damage there.
     block-type: "air"
 
 advanced:
@@ -147,3 +232,7 @@ advanced:
     # Also hide what gives away hidden areas: light (torches, lava), biomes (deep dark),
     # block entities (chests, spawners), block events, mining cracks, explosions, sounds and particles.
     strip-side-channels: true
+    # Also take hidden light that crosses into the next 16x16 column out of that column. Re-sends a
+    # chunk to a player now and then: when its neighbour, sent after it, turns out to have passed it
+    # light from a hidden area.
+    light-across-chunks: true

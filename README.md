@@ -112,12 +112,12 @@ because the player moved never waits for them.
 ### Upgrading from 1.1.0 or 1.2.0
 
 An existing `config.yml` keeps its old values (keys it lacks, such as `containers` and `entities.depth-only-types`,
-take their defaults, so the projectile, seed, per-world and light settings need nothing). To get the new defaults,
-add `BOAT`, `RAFT`, `HAPPY_GHAST` and `NAUTILUS` to `entities.hidden-types` and, from 1.2.0, `*bed`, `*sign`,
-`*banner` and `lectern` to `containers.hidden-blocks`. From 1.1.0, also set `performance.max-chunks-per-tick` to `8` and add `COPPER_GOLEM`,
-`TEXT_DISPLAY`, `ITEM_DISPLAY` and `BLOCK_DISPLAY` to `entities.hidden-types`. The `bedrock`,
-`performance.limited-area` and `advanced.packet-processing.modify-*` keys are no longer read and can be deleted (the
-console lists them): refreshes always cover the whole view distance, and every packet type is always filtered.
+take their defaults, so the projectile, seed, per-world and light settings need nothing). To get the new defaults, add
+`BOAT`, `RAFT`, `HAPPY_GHAST` and `NAUTILUS` to `entities.hidden-types`. From 1.1.0, also set
+`performance.max-chunks-per-tick` to `8` and add `COPPER_GOLEM`, `TEXT_DISPLAY`, `ITEM_DISPLAY` and `BLOCK_DISPLAY` to
+`entities.hidden-types`. The `bedrock`, `performance.limited-area` and `advanced.packet-processing.modify-*` keys are
+no longer read and can be deleted (the console lists them): refreshes always cover the whole view distance, and every
+packet type is always filtered.
 
 ## Commands and permissions
 
